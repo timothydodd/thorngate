@@ -23,7 +23,8 @@ func TestHoneypotMatches(t *testing.T) {
 		{"contains .php", Honeypot{Pattern: ".php", Match: "contains"}, "/foo/bar.php?a=1", true},
 		{"contains miss", Honeypot{Pattern: ".php", Match: "contains"}, "/foo/bar.html", false},
 		{"suffix", Honeypot{Pattern: ".env", Match: "suffix"}, "/config/.env", true},
-		{"glob", Honeypot{Pattern: "*.env", Match: "glob"}, "/.env", true},
+		{"glob hit", Honeypot{Pattern: "/cgi-bin/*", Match: "glob"}, "/cgi-bin/test.cgi", true},
+		{"glob no cross slash", Honeypot{Pattern: "/cgi-bin/*", Match: "glob"}, "/cgi-bin/sub/x", false},
 		{"regex git", Honeypot{Pattern: `\.(git|svn)(/|$)`, Match: "regex"}, "/.git/config", true},
 		{"regex miss", Honeypot{Pattern: `\.(git|svn)(/|$)`, Match: "regex"}, "/legit", false},
 	}

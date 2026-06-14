@@ -10,7 +10,8 @@
     "/wp-admin",
     "/wp-login.php",
     { "pattern": ".php", "match": "contains" },
-    { "pattern": "*.env", "match": "glob" },
+    { "pattern": ".env", "match": "suffix" },
+    { "pattern": "/cgi-bin/*", "match": "glob" },
     { "pattern": "\\.(git|svn|hg)(/|$)", "match": "regex" },
     { "pattern": "/phpmyadmin", "match": "prefix" }
   ],

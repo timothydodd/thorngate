@@ -61,7 +61,8 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 "honeypots": [
   "/wp-admin",                                       // prefix (boundary-aware)
   { "pattern": ".php",  "match": "contains" },       // block ANY path containing .php
-  { "pattern": "*.env", "match": "glob" },           // shell-style glob (path.Match)
+  { "pattern": ".env",  "match": "suffix" },         // any path ending in .env
+  { "pattern": "/cgi-bin/*", "match": "glob" },      // shell-style glob (path.Match)
   { "pattern": "\\.(git|svn|hg)(/|$)", "match": "regex" }
 ]
 ```
@@ -71,7 +72,7 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 | `prefix` (default) | path starts with pattern, on a `/` boundary (`/api` ≠ `/apixyz`) |
 | `contains` | pattern appears anywhere in the path — e.g. `.php` |
 | `suffix` | path ends with pattern |
-| `glob` | `path.Match` against the full path |
+| `glob` | `path.Match` against the full path (`*` does **not** cross `/` — use `contains`/`suffix` for "anywhere") |
 | `regex` | Go `regexp` against the full path |
 
 ### Routing
