@@ -52,11 +52,58 @@ type Config struct {
 	// is served on a SEPARATE port for managing the blacklist. Never attach
 	// this port to the Cloudflare tunnel — reach it via kubectl port-forward.
 	Admin *Admin `json:"admin"`
+
+	// RequestLog is OPTIONAL and ON by default. It remembers the last few
+	// requests each client IP made and dumps them to the log when that IP is
+	// blacklisted, so the recon leading up to a ban can be researched. Memory
+	// is bounded; set "disabled": true to turn it off.
+	RequestLog *RequestLog `json:"request_log"`
 }
+
+// RequestLog tunes the in-memory per-IP request history that is dumped to the
+// log whenever an IP is blacklisted. The zero value is enabled with defaults.
+type RequestLog struct {
+	// Disabled turns the feature off entirely (no per-IP tracking, zero
+	// overhead). Left false the feature is on.
+	Disabled bool `json:"disabled"`
+	// Depth is how many recent requests to keep per IP. Default 10.
+	Depth int `json:"depth"`
+	// MaxIPs caps how many distinct IPs are tracked at once; the
+	// least-recently active IP is evicted past this. Default 4096.
+	MaxIPs int `json:"max_ips"`
+	// TTL drops history for IPs idle longer than this (Go duration). Default "15m".
+	TTL string `json:"ttl"`
+
+	ttl time.Duration
+}
+
+func (r *RequestLog) compile() error {
+	if r.Depth <= 0 {
+		r.Depth = 10
+	}
+	if r.MaxIPs <= 0 {
+		r.MaxIPs = 4096
+	}
+	if r.TTL == "" {
+		r.TTL = "15m"
+	}
+	d, err := time.ParseDuration(r.TTL)
+	if err != nil {
+		return fmt.Errorf("ttl %q: %w", r.TTL, err)
+	}
+	r.ttl = d
+	return nil
+}
+
+// Enabled reports whether per-IP request history should be kept.
+func (r *RequestLog) Enabled() bool { return !r.Disabled }
+
+// TTLDur returns the parsed idle-eviction window.
+func (r *RequestLog) TTLDur() time.Duration { return r.ttl }
 
 // Admin configures the blacklist management endpoint.
 type Admin struct {
-	Enabled bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// Listen is the admin port, default ":9000". Keep it cluster-internal.
 	Listen string `json:"listen"`
 	// Token is the bearer token required by the API. If empty, it falls back
@@ -264,6 +311,12 @@ func Load(filePath string) (*Config, error) {
 		if err := c.TempBan.compile(); err != nil {
 			return nil, fmt.Errorf("config: temp_ban: %w", err)
 		}
+	}
+	if c.RequestLog == nil {
+		c.RequestLog = &RequestLog{} // on by default
+	}
+	if err := c.RequestLog.compile(); err != nil {
+		return nil, fmt.Errorf("config: request_log: %w", err)
 	}
 	if c.Admin != nil && c.Admin.Enabled {
 		if c.Admin.Listen == "" {

@@ -52,6 +52,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `routes` | optional `host` → `upstream` overrides (see Routing below) |
 | `temp_ban` | optional auto-ban for too many bad responses (see below) |
 | `admin` | optional token-protected admin API + web page (see below) |
+| `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
 
 ### Honeypot matching
 
@@ -118,6 +119,39 @@ Honeypots are an *instant, permanent* ban. `temp_ban` is the softer, optional la
 - Bans **auto-expire** after `ban_duration` (lazily removed on the next request, and dropped on restart if already lapsed).
 - Whitelisted IPs are never temp-banned; a honeypot (permanent) ban always outranks a temporary one.
 - Omit the whole `temp_ban` block to disable it (zero overhead — responses aren't even wrapped).
+
+### Request history on blacklist (`request_log`)
+
+When an IP trips a honeypot (or a temp-ban), the requests it made *just before* getting blocked are often the most useful signal — the recon and probing that led up to the trap. Thorngate keeps a short, in-memory ring buffer of the last few requests each client IP made while it was still allowed through, and dumps them to the log the moment that IP is blacklisted:
+
+```
+BLACKLISTED ip=9.9.9.9 honeypot=/wp-admin ua="curl/7.64.1" total=6
+  history ip=9.9.9.9 reason=honeypot 1/3 at=2026-06-14T12:34:55Z method=GET host="app.example.com" path="/" query="" status=200 ua="curl/7.64.1"
+  history ip=9.9.9.9 reason=honeypot 2/3 at=2026-06-14T12:34:56Z method=GET host="app.example.com" path="/robots.txt" query="" status=404 ua="curl/7.64.1"
+  history ip=9.9.9.9 reason=honeypot 3/3 at=2026-06-14T12:34:57Z method=GET host="app.example.com" path="/.env" query="" status=404 ua="curl/7.64.1"
+```
+
+It is **on by default** with sensible bounds — disable or tune it with a `request_log` block:
+
+```json
+"request_log": {
+  "disabled": false,
+  "depth": 10,
+  "max_ips": 4096,
+  "ttl": "15m"
+}
+```
+
+| field | meaning | default |
+|-------|---------|---------|
+| `disabled` | turn the feature off entirely (zero overhead) | `false` |
+| `depth` | how many recent requests to keep per IP | `10` |
+| `max_ips` | cap on distinct IPs tracked; least-recently-active is evicted past this | `4096` |
+| `ttl` | drop history for IPs idle longer than this (Go duration) | `"15m"` |
+
+- Every request that reaches an upstream is recorded (any response code), so probing that returned `404`/`401` — usually the telling part — is captured too. The honeypot request itself isn't proxied, so it never appears in its own history.
+- Memory is bounded on both axes (`depth` × `max_ips`) and idle IPs are swept on the `ttl` interval, so a flood of distinct sources can't exhaust memory. An IP's history is freed immediately once it's been logged.
+- History lives in memory only — it is **not** persisted to the blacklist file; restart and it's gone.
 
 ### Managing the blacklist (`admin`)
 

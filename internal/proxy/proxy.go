@@ -10,6 +10,7 @@ import (
 
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
+	"thorngate/internal/history"
 	"thorngate/internal/monitor"
 )
 
@@ -21,6 +22,7 @@ type WAF struct {
 	def    *httputil.ReverseProxy // default upstream for all traffic
 	routes []hostRoute            // optional hostname overrides
 	mon    *monitor.Monitor       // nil unless temp_ban is enabled
+	hist   *history.Tracker       // nil unless request_log is enabled
 }
 
 type hostRoute struct {
@@ -56,6 +58,16 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 		}()
 	}
 
+	if cfg.RequestLog != nil && cfg.RequestLog.Enabled() {
+		rl := cfg.RequestLog
+		w.hist = history.New(rl.Depth, rl.MaxIPs, rl.TTLDur())
+		go func() {
+			for range time.Tick(rl.TTLDur()) {
+				w.hist.Sweep()
+			}
+		}()
+	}
+
 	return w, nil
 }
 
@@ -87,6 +99,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		if w.bl.Add(ip, "honeypot", path) {
 			log.Printf("BLACKLISTED ip=%s honeypot=%s ua=%q total=%d",
 				ip, path, r.UserAgent(), w.bl.Count())
+			w.dumpHistory(ip, "honeypot")
 		}
 		forbidden(rw)
 		return
@@ -95,15 +108,52 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// 3. Hostname override? Otherwise fall through to the default upstream.
 	up := w.upstreamFor(r)
 
-	// When temp-ban monitoring is off, proxy directly with no wrapping.
-	if w.mon == nil {
+	// With neither temp-ban monitoring nor request logging, proxy directly
+	// with no response wrapping.
+	if w.mon == nil && w.hist == nil {
 		up.ServeHTTP(rw, r)
 		return
 	}
 
 	sw := &statusWriter{ResponseWriter: rw, status: http.StatusOK}
 	up.ServeHTTP(sw, r)
-	w.monitorResponse(ip, sw.status)
+	w.recordRequest(ip, r, sw.status)
+	if w.mon != nil {
+		w.monitorResponse(ip, sw.status)
+	}
+}
+
+// recordRequest remembers a request that reached an upstream so it can be
+// dumped for context if this IP is later blacklisted. No-op when disabled.
+func (w *WAF) recordRequest(ip string, r *http.Request, status int) {
+	if w.hist == nil {
+		return
+	}
+	w.hist.Record(ip, history.Record{
+		Time:   time.Now().UTC(),
+		Method: r.Method,
+		Host:   r.Host,
+		Path:   r.URL.Path,
+		Query:  r.URL.RawQuery,
+		UA:     r.UserAgent(),
+		Status: status,
+	})
+}
+
+// dumpHistory logs the recent requests this IP made before being blacklisted,
+// to help research emerging attack patterns, then forgets them. No-op when
+// request logging is disabled or there is no history for the IP.
+func (w *WAF) dumpHistory(ip, reason string) {
+	if w.hist == nil {
+		return
+	}
+	recs := w.hist.History(ip)
+	for i, rec := range recs {
+		log.Printf("  history ip=%s reason=%s %d/%d at=%s method=%s host=%q path=%q query=%q status=%d ua=%q",
+			ip, reason, i+1, len(recs), rec.Time.Format(time.RFC3339),
+			rec.Method, rec.Host, rec.Path, rec.Query, rec.Status, rec.UA)
+	}
+	w.hist.Forget(ip)
 }
 
 func (w *WAF) upstreamFor(r *http.Request) *httputil.ReverseProxy {
@@ -125,6 +175,7 @@ func (w *WAF) monitorResponse(ip string, status int) {
 	if w.mon.Strike(ip) && w.bl.AddTemp(ip, "rate-limit", tb.BanDur()) {
 		log.Printf("TEMP-BANNED ip=%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
 			ip, tb.BanDuration, tb.Max, tb.Window, status, w.bl.Count())
+		w.dumpHistory(ip, "rate-limit")
 	}
 }
 

@@ -82,9 +82,9 @@ func TestParseUpstream(t *testing.T) {
 
 func TestRouteMatchHost(t *testing.T) {
 	cases := []struct {
-		host  string
-		req   string
-		want  bool
+		host string
+		req  string
+		want bool
 	}{
 		{"api.example.com", "api.example.com", true},
 		{"api.example.com", "API.example.com:443", true},
