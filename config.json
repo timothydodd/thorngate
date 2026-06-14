@@ -1,0 +1,34 @@
+{
+  "listen": ":8765",
+  "client_ip_header": "Cf-Connecting-Ip",
+  "blacklist_file": "/data/blacklist.json",
+  "whitelist": [
+    "127.0.0.1",
+    "10.0.0.0/8"
+  ],
+  "honeypots": [
+    "/wp-admin",
+    "/wp-login.php",
+    { "pattern": ".php", "match": "contains" },
+    { "pattern": "*.env", "match": "glob" },
+    { "pattern": "\\.(git|svn|hg)(/|$)", "match": "regex" },
+    { "pattern": "/phpmyadmin", "match": "prefix" }
+  ],
+  "temp_ban": {
+    "enabled": true,
+    "status_codes": [401, 403, 404, 429],
+    "max": 20,
+    "window": "1m",
+    "ban_duration": "15m"
+  },
+  "admin": {
+    "enabled": true,
+    "listen": ":9000",
+    "token": "change-me-locally"
+  },
+  "upstream": "10.0.0.10:8080",
+  "routes": [
+    { "host": "api.example.com", "upstream": "10.0.0.5:3000" },
+    { "host": "*.internal.example.com", "upstream": "10.0.0.6:9000" }
+  ]
+}

@@ -1,0 +1,320 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// Config is the top-level configuration loaded from a JSON file.
+type Config struct {
+	// Listen is the address the WAF listens on, e.g. ":8765".
+	Listen string `json:"listen"`
+
+	// ClientIPHeader is the header that holds the real external client IP.
+	// Behind a Cloudflare Tunnel this is "Cf-Connecting-Ip".
+	ClientIPHeader string `json:"client_ip_header"`
+
+	// BlacklistFile is where blacklisted IPs are persisted as JSON.
+	// In k8s point this at a mounted volume so it survives restarts.
+	BlacklistFile string `json:"blacklist_file"`
+
+	// Honeypots are patterns that should never be hit by a legitimate client.
+	// Any external IP that matches one is blacklisted immediately.
+	Honeypots []Honeypot `json:"honeypots"`
+
+	// Whitelist are IPs (or CIDRs) that are never blacklisted, e.g. your own
+	// office IP or health-check sources.
+	Whitelist []string `json:"whitelist"`
+
+	// Upstream is the default internal target that ALL traffic is proxied to
+	// unless a hostname route below matches. Accepts an IP/host with optional
+	// port and optional scheme, e.g. "10.0.0.10:8080", "10.0.0.10",
+	// or "http://my-app.svc.cluster.local:8080" (scheme defaults to http).
+	Upstream string `json:"upstream"`
+
+	// Routes are OPTIONAL hostname overrides. A request whose Host matches a
+	// route is sent to that route's upstream; everything else falls through to
+	// the default Upstream above.
+	Routes []Route `json:"routes"`
+
+	// TempBan is OPTIONAL. When enabled, an IP that produces too many "bad"
+	// response codes within a time window is temporarily blacklisted.
+	TempBan *TempBan `json:"temp_ban"`
+
+	// Admin is OPTIONAL. When enabled, a token-protected admin API + web page
+	// is served on a SEPARATE port for managing the blacklist. Never attach
+	// this port to the Cloudflare tunnel — reach it via kubectl port-forward.
+	Admin *Admin `json:"admin"`
+}
+
+// Admin configures the blacklist management endpoint.
+type Admin struct {
+	Enabled bool   `json:"enabled"`
+	// Listen is the admin port, default ":9000". Keep it cluster-internal.
+	Listen string `json:"listen"`
+	// Token is the bearer token required by the API. If empty, it falls back
+	// to the THORNGATE_ADMIN_TOKEN environment variable (prefer a k8s Secret).
+	Token string `json:"token"`
+}
+
+// TempBan auto-bans IPs that generate too many bad responses (e.g. scanners
+// hammering 404s). Bans expire on their own after BanDuration.
+type TempBan struct {
+	Enabled bool `json:"enabled"`
+	// StatusCodes that count as "bad". Default: 401, 403, 404, 429.
+	StatusCodes []int `json:"status_codes"`
+	// Max bad responses allowed within Window before a ban kicks in. Default 20.
+	Max int `json:"max"`
+	// Window is the sliding window for counting, e.g. "1m". Default "1m".
+	Window string `json:"window"`
+	// BanDuration is how long the temporary ban lasts, e.g. "15m". Default "15m".
+	BanDuration string `json:"ban_duration"`
+
+	window time.Duration
+	banDur time.Duration
+	codes  map[int]bool
+}
+
+func (t *TempBan) compile() error {
+	if t.Max <= 0 {
+		t.Max = 20
+	}
+	if len(t.StatusCodes) == 0 {
+		t.StatusCodes = []int{401, 403, 404, 429}
+	}
+	if t.Window == "" {
+		t.Window = "1m"
+	}
+	if t.BanDuration == "" {
+		t.BanDuration = "15m"
+	}
+	w, err := time.ParseDuration(t.Window)
+	if err != nil {
+		return fmt.Errorf("window %q: %w", t.Window, err)
+	}
+	d, err := time.ParseDuration(t.BanDuration)
+	if err != nil {
+		return fmt.Errorf("ban_duration %q: %w", t.BanDuration, err)
+	}
+	t.window, t.banDur = w, d
+	t.codes = make(map[int]bool, len(t.StatusCodes))
+	for _, c := range t.StatusCodes {
+		t.codes[c] = true
+	}
+	return nil
+}
+
+// WindowDur returns the parsed counting window.
+func (t *TempBan) WindowDur() time.Duration { return t.window }
+
+// BanDur returns the parsed ban duration.
+func (t *TempBan) BanDur() time.Duration { return t.banDur }
+
+// IsBadCode reports whether a response status counts toward a ban.
+func (t *TempBan) IsBadCode(code int) bool { return t.codes[code] }
+
+// Route sends a specific hostname to a specific internal upstream.
+type Route struct {
+	// Host matches the request Host header (case-insensitive, port ignored).
+	// A leading "*." is a wildcard, e.g. "*.example.com" matches any subdomain
+	// (a.example.com, a.b.example.com) but not the apex example.com itself.
+	Host string `json:"host"`
+	// Upstream is the internal target for this host. Same format as the
+	// top-level Upstream (IP / host:port / full URL; scheme defaults to http).
+	Upstream string `json:"upstream"`
+}
+
+// Honeypot is a request matcher. In JSON it may be either:
+//
+//	"/wp-admin"                                  // shorthand: prefix match
+//	{ "pattern": ".php", "match": "contains" }   // explicit match mode
+//
+// Supported match modes: "prefix" (default), "contains", "suffix",
+// "glob" (path.Match against the full path), "regex".
+type Honeypot struct {
+	Pattern string `json:"pattern"`
+	Match   string `json:"match"`
+
+	re *regexp.Regexp // compiled, for match == "regex"
+}
+
+// UnmarshalJSON lets a honeypot be a bare string (prefix) or a full object.
+func (h *Honeypot) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		h.Pattern = s
+		h.Match = "prefix"
+		return nil
+	}
+	type raw Honeypot // avoid recursing into this method
+	var r raw
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	*h = Honeypot(r)
+	if h.Match == "" {
+		h.Match = "prefix"
+	}
+	return nil
+}
+
+func (h *Honeypot) compile() error {
+	switch h.Match {
+	case "prefix":
+		if !strings.HasPrefix(h.Pattern, "/") {
+			h.Pattern = "/" + h.Pattern
+		}
+	case "contains", "suffix":
+		// nothing to precompile
+	case "glob":
+		if _, err := path.Match(h.Pattern, "/"); err != nil {
+			return fmt.Errorf("invalid glob %q: %w", h.Pattern, err)
+		}
+	case "regex":
+		re, err := regexp.Compile(h.Pattern)
+		if err != nil {
+			return fmt.Errorf("invalid regex %q: %w", h.Pattern, err)
+		}
+		h.re = re
+	default:
+		return fmt.Errorf("unknown match mode %q (want prefix|contains|suffix|glob|regex)", h.Match)
+	}
+	if h.Pattern == "" {
+		return fmt.Errorf("honeypot pattern is empty")
+	}
+	return nil
+}
+
+// Matches reports whether a request path trips this honeypot.
+func (h *Honeypot) Matches(reqPath string) bool {
+	switch h.Match {
+	case "prefix":
+		return prefixMatch(reqPath, h.Pattern)
+	case "contains":
+		return strings.Contains(reqPath, h.Pattern)
+	case "suffix":
+		return strings.HasSuffix(reqPath, h.Pattern)
+	case "glob":
+		ok, _ := path.Match(h.Pattern, reqPath)
+		return ok
+	case "regex":
+		return h.re.MatchString(reqPath)
+	}
+	return false
+}
+
+// prefixMatch matches on path boundaries so "/api" matches "/api" and "/api/x"
+// but not "/apixyz".
+func prefixMatch(reqPath, prefix string) bool {
+	if prefix == "/" {
+		return true
+	}
+	if !strings.HasPrefix(reqPath, prefix) {
+		return false
+	}
+	rest := reqPath[len(prefix):]
+	return rest == "" || rest[0] == '/'
+}
+
+// Load reads and validates a config file.
+func Load(filePath string) (*Config, error) {
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var c Config
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	if c.Listen == "" {
+		c.Listen = ":8765"
+	}
+	if c.ClientIPHeader == "" {
+		c.ClientIPHeader = "Cf-Connecting-Ip"
+	}
+	if c.Upstream == "" {
+		return nil, fmt.Errorf("config: a default upstream is required")
+	}
+	if _, err := ParseUpstream(c.Upstream); err != nil {
+		return nil, fmt.Errorf("config: upstream %q: %w", c.Upstream, err)
+	}
+	for i, r := range c.Routes {
+		if r.Host == "" || r.Upstream == "" {
+			return nil, fmt.Errorf("config: route %d needs both host and upstream", i)
+		}
+		if _, err := ParseUpstream(r.Upstream); err != nil {
+			return nil, fmt.Errorf("config: route %d upstream %q: %w", i, r.Upstream, err)
+		}
+	}
+	for i := range c.Honeypots {
+		if err := c.Honeypots[i].compile(); err != nil {
+			return nil, fmt.Errorf("config: honeypot %d: %w", i, err)
+		}
+	}
+	if c.TempBan != nil && c.TempBan.Enabled {
+		if err := c.TempBan.compile(); err != nil {
+			return nil, fmt.Errorf("config: temp_ban: %w", err)
+		}
+	}
+	if c.Admin != nil && c.Admin.Enabled {
+		if c.Admin.Listen == "" {
+			c.Admin.Listen = ":9000"
+		}
+		if c.Admin.Token == "" {
+			c.Admin.Token = os.Getenv("THORNGATE_ADMIN_TOKEN")
+		}
+		if c.Admin.Token == "" {
+			return nil, fmt.Errorf("config: admin enabled but no token (set admin.token or THORNGATE_ADMIN_TOKEN)")
+		}
+	}
+
+	return &c, nil
+}
+
+// ParseUpstream turns a config upstream value into a URL the proxy can use.
+// It accepts a full URL ("http://10.0.0.5:3000"), a host:port ("10.0.0.5:3000"),
+// or a bare host/IP ("10.0.0.5"); the scheme defaults to http.
+func ParseUpstream(s string) (*url.URL, error) {
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+	return u, nil
+}
+
+// MatchHost reports whether a request host matches this route. Matching is
+// case-insensitive and ignores any port. A route Host of "*.example.com"
+// matches any single-or-multi-level subdomain of example.com.
+func (r *Route) MatchHost(host string) bool {
+	host = normalizeHost(host)
+	want := strings.ToLower(r.Host)
+	if suffix, ok := strings.CutPrefix(want, "*."); ok {
+		// Subdomains only, not the apex (DNS-standard wildcard semantics).
+		return strings.HasSuffix(host, "."+suffix)
+	}
+	return host == want
+}
+
+// normalizeHost lowercases a Host header value and strips any :port.
+func normalizeHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}

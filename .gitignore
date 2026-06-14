@@ -1,0 +1,4 @@
+/thorngate
+*.tmp
+blacklist.json
+/data/

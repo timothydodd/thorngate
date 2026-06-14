@@ -1,0 +1,164 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thorngate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: thorngate-config
+  namespace: thorngate
+data:
+  config.json: |
+    {
+      "listen": ":8765",
+      "client_ip_header": "Cf-Connecting-Ip",
+      "blacklist_file": "/data/blacklist.json",
+      "whitelist": ["127.0.0.1", "10.0.0.0/8"],
+      "honeypots": [
+        "/wp-admin",
+        "/wp-login.php",
+        { "pattern": ".php", "match": "contains" },
+        { "pattern": "*.env", "match": "glob" },
+        { "pattern": "\\.(git|svn|hg)(/|$)", "match": "regex" },
+        { "pattern": "/phpmyadmin", "match": "prefix" }
+      ],
+      "temp_ban": {
+        "enabled": true,
+        "status_codes": [401, 403, 404, 429],
+        "max": 20,
+        "window": "1m",
+        "ban_duration": "15m"
+      },
+      "admin": {
+        "enabled": true,
+        "listen": ":9000"
+      },
+      "upstream": "10.0.0.10:8080",
+      "routes": [
+        { "host": "api.example.com", "upstream": "10.0.0.5:3000" },
+        { "host": "*.internal.example.com", "upstream": "10.0.0.6:9000" }
+      ]
+    }
+---
+# Admin API bearer token. Replace the value, or create it out-of-band with:
+#   kubectl -n thorngate create secret generic thorngate-admin \
+#     --from-literal=token="$(openssl rand -hex 24)"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: thorngate-admin
+  namespace: thorngate
+type: Opaque
+stringData:
+  token: change-me-please
+---
+# Persists the blacklist across restarts. k3s ships local-path as the default
+# StorageClass, so this just works. RWO is fine because we run a single replica.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: thorngate-data
+  namespace: thorngate
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: thorngate
+  namespace: thorngate
+spec:
+  # Single replica: the blacklist is in-memory + a file on a RWO volume.
+  # For multiple replicas you'd swap the file store for Redis (see README).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: thorngate
+  template:
+    metadata:
+      labels:
+        app: thorngate
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532  # distroless "nonroot" gid, so /data is writable
+      containers:
+        - name: thorngate
+          image: ghcr.io/YOUR_USER/thorngate:latest  # <-- ghcr.io/<owner>/<repo>, published by release.yml
+          ports:
+            - name: http
+              containerPort: 8765
+            - name: admin
+              containerPort: 9000
+          env:
+            - name: THORNGATE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: thorngate-admin
+                  key: token
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8765
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8765
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/thorngate
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: thorngate-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: thorngate-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: thorngate
+  namespace: thorngate
+spec:
+  selector:
+    app: thorngate
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8765
+---
+# Admin Service — ClusterIP only. NEVER attach this to the Cloudflare tunnel.
+# Reach it with: kubectl -n thorngate port-forward svc/thorngate-admin 9000:9000
+apiVersion: v1
+kind: Service
+metadata:
+  name: thorngate-admin
+  namespace: thorngate
+spec:
+  selector:
+    app: thorngate
+  ports:
+    - name: admin
+      port: 9000
+      targetPort: 9000
