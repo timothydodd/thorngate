@@ -38,13 +38,13 @@ func TestHoneypotMatches(t *testing.T) {
 }
 
 func TestPrefixMatch(t *testing.T) {
-	if !PrefixMatch("/anything", "/") {
+	if !prefixMatch("/anything", "/") {
 		t.Error(`"/" should match everything`)
 	}
-	if PrefixMatch("/apixyz", "/api") {
+	if prefixMatch("/apixyz", "/api") {
 		t.Error("prefix must respect path boundary")
 	}
-	if !PrefixMatch("/api/v1", "/api") {
+	if !prefixMatch("/api/v1", "/api") {
 		t.Error("/api should match /api/v1")
 	}
 }
