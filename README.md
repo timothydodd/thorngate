@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="thorngate logo" width="160">
+</p>
+
 # thorngate
 
 A tiny, zero-dependency Go reverse-proxy WAF that sits behind a **Cloudflare Tunnel** and in front of your web/API services — a gate at the mouth of the tunnel that snags intruders. It:
