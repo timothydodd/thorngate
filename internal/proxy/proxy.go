@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -236,4 +238,21 @@ func (s *statusWriter) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack lets the underlying connection be taken over for protocol upgrades
+// (WebSockets, SignalR). ReverseProxy requires the ResponseWriter to implement
+// http.Hijacker before it will switch protocols; since we wrap it, we must
+// forward the call. A hijacked connection bypasses WriteHeader, so we record a
+// 101 status for monitoring/history.
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := s.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("upstream: ResponseWriter does not support hijacking")
+	}
+	if !s.wroteHeader {
+		s.status = http.StatusSwitchingProtocols
+		s.wroteHeader = true
+	}
+	return hj.Hijack()
 }
