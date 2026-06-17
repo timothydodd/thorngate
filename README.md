@@ -182,14 +182,17 @@ API (constant-time token check; the HTML page carries no secret and prompts for 
 | method | path | body | action |
 |--------|------|------|--------|
 | `GET` | `/admin/blacklist` | — | list all entries (JSON) |
-| `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP |
-| `DELETE` | `/admin/blacklist/{ip}` | — | unban an IP |
+| `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP or CIDR range |
+| `DELETE` | `/admin/blacklist/{key}` | — | unban an IP or CIDR range |
 | `GET` | `/admin/` | — | the web page |
+
+The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range.
 
 ```bash
 TOKEN=change-me-locally
 curl -H "Authorization: Bearer $TOKEN" localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.4"}' localhost:9000/admin/blacklist
+curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.0/24"}' localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -X DELETE localhost:9000/admin/blacklist/1.2.3.4
 ```
 

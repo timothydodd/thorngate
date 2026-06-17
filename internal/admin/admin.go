@@ -36,8 +36,8 @@ func Handler(bl *blacklist.Blacklist, token string) http.Handler {
 			return
 		}
 		ip := strings.TrimSpace(body.IP)
-		if net.ParseIP(ip) == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid IP address"})
+		if !validBanKey(ip) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid IP address or CIDR range"})
 			return
 		}
 		reason := body.Reason
@@ -51,8 +51,10 @@ func Handler(bl *blacklist.Blacklist, token string) http.Handler {
 		added := bl.Add(ip, reason, "")
 		writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "added": added})
 	})))
-	mux.Handle("DELETE /admin/blacklist/{ip}", auth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.PathValue("ip")
+	// {key...} is a trailing wildcard so CIDR ranges (which contain a "/") can be
+	// deleted, e.g. DELETE /admin/blacklist/1.2.3.0/24.
+	mux.Handle("DELETE /admin/blacklist/{key...}", auth(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := r.PathValue("key")
 		removed := bl.Remove(ip)
 		writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "removed": removed})
 	})))
@@ -71,6 +73,16 @@ func auth(token string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// validBanKey reports whether s is a usable blacklist key: a single IP address
+// or a CIDR range.
+func validBanKey(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(s)
+	return err == nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

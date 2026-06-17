@@ -67,6 +67,25 @@ func TestAddListRemove(t *testing.T) {
 	}
 }
 
+func TestAddListRemoveCIDR(t *testing.T) {
+	srv, bl := newServer(t)
+	defer srv.Close()
+
+	if res := do(t, srv, "POST", "/admin/blacklist", `{"ip":"1.2.3.0/24","reason":"subnet"}`, token); res.StatusCode != http.StatusOK {
+		t.Fatalf("add CIDR: got %d, want 200", res.StatusCode)
+	}
+	if !bl.IsBlocked("1.2.3.99") {
+		t.Fatal("an IP in the added CIDR should be blocked")
+	}
+
+	if res := do(t, srv, "DELETE", "/admin/blacklist/1.2.3.0/24", "", token); res.StatusCode != http.StatusOK {
+		t.Fatalf("remove CIDR: got %d, want 200", res.StatusCode)
+	}
+	if bl.IsBlocked("1.2.3.99") {
+		t.Fatal("CIDR ban should be gone after remove")
+	}
+}
+
 func TestAddRejectsBadIP(t *testing.T) {
 	srv, _ := newServer(t)
 	defer srv.Close()

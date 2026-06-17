@@ -97,10 +97,10 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Honeypot hit? Blacklist and 403.
-	if path, hit := w.honeypot(r.URL.Path); hit {
-		if w.bl.Add(ip, "honeypot", path) {
-			log.Printf("BLACKLISTED ip=%s honeypot=%s ua=%q total=%d",
-				ip, path, r.UserAgent(), w.bl.Count())
+	if pattern, hit := w.honeypot(r.URL.Path); hit {
+		if w.bl.Add(ip, "honeypot", pattern) {
+			log.Printf("BLACKLISTED ip=%s path=%s honeypot=%s ua=%q total=%d",
+				ip, r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
 			w.dumpHistory(ip, "honeypot")
 		}
 		forbidden(rw)
