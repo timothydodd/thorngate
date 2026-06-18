@@ -6,7 +6,7 @@
 
 A tiny, zero-dependency Go reverse-proxy WAF that sits behind a **Cloudflare Tunnel** and in front of your web/API services — a gate at the mouth of the tunnel that snags intruders. It:
 
-- Reverse-proxies configured **path prefixes → internal upstreams** (k8s services or raw IPs).
+- Reverse-proxies configured **path prefixes → internal upstreams** (k8s services or raw IPs), including **WebSocket / SignalR** (protocol-upgrade) connections.
 - Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and gets `403` on every future request.
 - Resolves the real external IP from Cloudflare's `Cf-Connecting-Ip` header.
 - Persists the blacklist to disk so it survives restarts.
@@ -97,6 +97,8 @@ All traffic is proxied to the single default `upstream`. `routes` are **optional
 - A leading `*.` is a wildcard: `*.example.com` matches `a.example.com` and `a.b.example.com`, but **not** the apex `example.com` (add an explicit route for that).
 
 If you only need a single backend, just set `upstream` and omit `routes` entirely.
+
+**Protocol upgrades** (WebSocket, SignalR) pass through transparently — thorngate hijacks the connection and hands it to the upstream, so long-lived bidirectional streams work without extra config. Upgraded connections are recorded as a `101` status for temp-ban/history accounting.
 
 ### Temporary bans (`temp_ban`)
 
