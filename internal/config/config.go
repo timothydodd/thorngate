@@ -58,7 +58,39 @@ type Config struct {
 	// blacklisted, so the recon leading up to a ban can be researched. Memory
 	// is bounded; set "disabled": true to turn it off.
 	RequestLog *RequestLog `json:"request_log"`
+
+	// Stats is OPTIONAL and ON by default. It keeps in-memory traffic counters
+	// (totals + a rolling per-minute series) for the admin portal. The overhead
+	// is a few atomic increments per request; set "disabled": true to turn it
+	// off. Counters are memory-only and reset on restart.
+	Stats *Stats `json:"stats"`
 }
+
+// Stats tunes the in-memory traffic counters surfaced by the admin portal.
+// The zero value is enabled with defaults.
+type Stats struct {
+	// Disabled turns the feature off entirely (no counters, zero overhead).
+	Disabled bool `json:"disabled"`
+	// WindowMinutes is how many minutes the traffic-over-time series covers.
+	// Default 60.
+	WindowMinutes int `json:"window_minutes"`
+	// RecentRequests is how many recent requests to keep in the dashboard's
+	// live feed (IP + path + outcome). Default 100; set negative to omit it.
+	RecentRequests int `json:"recent_requests"`
+}
+
+func (s *Stats) compile() error {
+	if s.WindowMinutes <= 0 {
+		s.WindowMinutes = 60
+	}
+	if s.RecentRequests == 0 {
+		s.RecentRequests = 100
+	}
+	return nil
+}
+
+// Enabled reports whether traffic counters should be kept.
+func (s *Stats) Enabled() bool { return !s.Disabled }
 
 // RequestLog tunes the in-memory per-IP request history that is dumped to the
 // log whenever an IP is blacklisted. The zero value is enabled with defaults.
@@ -317,6 +349,12 @@ func Load(filePath string) (*Config, error) {
 	}
 	if err := c.RequestLog.compile(); err != nil {
 		return nil, fmt.Errorf("config: request_log: %w", err)
+	}
+	if c.Stats == nil {
+		c.Stats = &Stats{} // on by default
+	}
+	if err := c.Stats.compile(); err != nil {
+		return nil, fmt.Errorf("config: stats: %w", err)
 	}
 	if c.Admin != nil && c.Admin.Enabled {
 		if c.Admin.Listen == "" {

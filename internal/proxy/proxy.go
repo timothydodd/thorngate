@@ -14,6 +14,7 @@ import (
 	"thorngate/internal/config"
 	"thorngate/internal/history"
 	"thorngate/internal/monitor"
+	"thorngate/internal/stats"
 )
 
 // WAF is an http.Handler that blacklists honeypot hitters and reverse-proxies
@@ -25,6 +26,7 @@ type WAF struct {
 	routes []hostRoute            // optional hostname overrides
 	mon    *monitor.Monitor       // nil unless temp_ban is enabled
 	hist   *history.Tracker       // nil unless request_log is enabled
+	stats  *stats.Collector       // nil unless stats is enabled
 }
 
 type hostRoute struct {
@@ -70,8 +72,16 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 		}()
 	}
 
+	if cfg.Stats != nil && cfg.Stats.Enabled() {
+		w.stats = stats.New(cfg.Stats.WindowMinutes, cfg.Stats.RecentRequests)
+	}
+
 	return w, nil
 }
+
+// Stats returns the traffic collector, or nil if stats are disabled. The admin
+// portal reads it to render the dashboard.
+func (w *WAF) Stats() *stats.Collector { return w.stats }
 
 // newProxy builds a single-host reverse proxy for an upstream config value.
 func newProxy(upstream string) (*httputil.ReverseProxy, error) {
@@ -92,8 +102,15 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	// 1. Already blacklisted? Hard 403, no upstream contact.
 	if w.bl.IsBlocked(ip) {
+		if w.stats != nil {
+			w.stats.Request(true)
+			w.observe(ip, r, http.StatusForbidden, "blocked")
+		}
 		forbidden(rw)
 		return
+	}
+	if w.stats != nil {
+		w.stats.Request(false)
 	}
 
 	// 2. Honeypot hit? Blacklist and 403.
@@ -102,6 +119,12 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			log.Printf("BLACKLISTED ip=%s path=%s honeypot=%s ua=%q total=%d",
 				ip, r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
 			w.dumpHistory(ip, "honeypot")
+			if w.stats != nil {
+				w.stats.Honeypot()
+			}
+		}
+		if w.stats != nil {
+			w.observe(ip, r, http.StatusForbidden, "honeypot")
 		}
 		forbidden(rw)
 		return
@@ -110,9 +133,9 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// 3. Hostname override? Otherwise fall through to the default upstream.
 	up := w.upstreamFor(r)
 
-	// With neither temp-ban monitoring nor request logging, proxy directly
-	// with no response wrapping.
-	if w.mon == nil && w.hist == nil {
+	// With no response-inspecting feature enabled, proxy directly with no
+	// response wrapping.
+	if w.mon == nil && w.hist == nil && w.stats == nil {
 		up.ServeHTTP(rw, r)
 		return
 	}
@@ -120,9 +143,27 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{ResponseWriter: rw, status: http.StatusOK}
 	up.ServeHTTP(sw, r)
 	w.recordRequest(ip, r, sw.status)
+	if w.stats != nil {
+		w.stats.Status(sw.status)
+		w.observe(ip, r, sw.status, "proxied")
+	}
 	if w.mon != nil {
 		w.monitorResponse(ip, sw.status)
 	}
+}
+
+// observe records a request in the stats recent-requests feed. Caller has
+// already checked w.stats != nil.
+func (w *WAF) observe(ip string, r *http.Request, status int, outcome string) {
+	w.stats.Observe(stats.Event{
+		Time:    time.Now().UTC(),
+		IP:      ip,
+		Method:  r.Method,
+		Host:    r.Host,
+		Path:    r.URL.Path,
+		Status:  status,
+		Outcome: outcome,
+	})
 }
 
 // recordRequest remembers a request that reached an upstream so it can be
@@ -178,6 +219,9 @@ func (w *WAF) monitorResponse(ip string, status int) {
 		log.Printf("TEMP-BANNED ip=%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
 			ip, tb.BanDuration, tb.Max, tb.Window, status, w.bl.Count())
 		w.dumpHistory(ip, "rate-limit")
+		if w.stats != nil {
+			w.stats.TempBan()
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"thorngate/internal/blacklist"
+	"thorngate/internal/stats"
 )
 
 const token = "secret-token"
@@ -17,7 +18,7 @@ func newServer(t *testing.T) (*httptest.Server, *blacklist.Blacklist) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return httptest.NewServer(Handler(bl, token)), bl
+	return httptest.NewServer(Handler(bl, stats.New(60, 100), token)), bl
 }
 
 func do(t *testing.T, srv *httptest.Server, method, path, body, tok string) *http.Response {

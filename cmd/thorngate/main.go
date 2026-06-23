@@ -63,7 +63,7 @@ func main() {
 	if cfg.Admin != nil && cfg.Admin.Enabled {
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
-			Handler:           admin.Handler(bl, cfg.Admin.Token),
+			Handler:           admin.Handler(bl, waf.Stats(), cfg.Admin.Token),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {

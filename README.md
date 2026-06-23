@@ -35,6 +35,8 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 │   ├── config/           # config load + honeypot matchers (+ tests)
 │   ├── blacklist/        # thread-safe, file-persisted blocklist
 │   ├── monitor/          # per-IP sliding-window strike counter (temp bans)
+│   ├── history/          # bounded per-IP request history (dumped on ban)
+│   ├── stats/            # in-memory traffic counters for the dashboard
 │   ├── admin/            # token-protected admin API + web page
 │   └── proxy/            # IP extraction, honeypot check, host routing
 ├── deploy/k3s/           # k3s manifests (ConfigMap, PVC, Deployment, Service)
@@ -57,6 +59,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `temp_ban` | optional auto-ban for too many bad responses (see below) |
 | `admin` | optional token-protected admin API + web page (see below) |
 | `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
+| `stats` | in-memory traffic counters for the admin dashboard (on by default, see below) |
 
 ### Honeypot matching
 
@@ -159,9 +162,32 @@ It is **on by default** with sensible bounds — disable or tune it with a `requ
 - Memory is bounded on both axes (`depth` × `max_ips`) and idle IPs are swept on the `ttl` interval, so a flood of distinct sources can't exhaust memory. An IP's history is freed immediately once it's been logged.
 - History lives in memory only — it is **not** persisted to the blacklist file; restart and it's gone.
 
+### Traffic stats (`stats`)
+
+thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, and a 2xx/3xx/4xx/5xx breakdown of proxied responses, plus a per-minute requests-vs-blocked chart and a **live feed of recent requests** (time, IP, method, path, status, and outcome — `proxied` / `blocked` / `honeypot`).
+
+It is **on by default** — the headline totals are lock-free atomics and the time series is a small per-minute ring buffer, so the overhead is a few increments per request. Disable or tune it with a `stats` block:
+
+```json
+"stats": {
+  "disabled": false,
+  "window_minutes": 60,
+  "recent_requests": 100
+}
+```
+
+| field | meaning | default |
+|-------|---------|---------|
+| `disabled` | turn the feature off entirely (zero overhead; the dashboard reports stats as off) | `false` |
+| `window_minutes` | how many minutes the traffic-over-time chart covers | `60` |
+| `recent_requests` | how many recent requests to keep in the live feed (IP + path + outcome); set negative to omit the feed | `100` |
+
+- Counters live in memory only — they are **not** persisted and reset to zero on restart.
+- Read them programmatically via `GET /admin/stats` (same bearer token as the rest of the admin API).
+
 ### Managing the blacklist (`admin`)
 
-An optional admin endpoint on a **separate port** lets you view, add, and remove blocked IPs live (changes hit the in-memory store and are persisted immediately — no restart). It serves both a JSON API and a single self-contained web page.
+An optional admin endpoint on a **separate port** lets you view, add, and remove blocked IPs live (changes hit the in-memory store and are persisted immediately — no restart). It serves both a JSON API and a single self-contained web page. The page has two tabs: a **Dashboard** with traffic stats (see `stats` below) and the **Blacklist** manager. It auto-refreshes every 10s and styles itself with [Tailwind](https://tailwindcss.com) via the Play CDN — the page is loaded in your own browser over the port-forward, so the CDN fetch happens browser-side; the thorngate binary itself stays dependency-free and offline-buildable.
 
 ```json
 "admin": {
@@ -186,6 +212,7 @@ API (constant-time token check; the HTML page carries no secret and prompts for 
 | `GET` | `/admin/blacklist` | — | list all entries (JSON) |
 | `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP or CIDR range |
 | `DELETE` | `/admin/blacklist/{key}` | — | unban an IP or CIDR range |
+| `GET` | `/admin/stats` | — | traffic counters + per-minute series (JSON; `{"enabled":false}` if stats are off) |
 | `GET` | `/admin/` | — | the web page |
 
 The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range.
