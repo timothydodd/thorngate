@@ -189,6 +189,10 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 
 An optional admin endpoint on a **separate port** lets you view, add, and remove blocked IPs live (changes hit the in-memory store and are persisted immediately — no restart). It serves both a JSON API and a single self-contained web page. The page has two tabs: a **Dashboard** with traffic stats (see `stats` below) and the **Blacklist** manager. It auto-refreshes every 10s and styles itself with [Tailwind](https://tailwindcss.com) via the Play CDN — the page is loaded in your own browser over the port-forward, so the CDN fetch happens browser-side; the thorngate binary itself stays dependency-free and offline-buildable.
 
+<p align="center">
+  <img src="assets/screenshot.jpg" alt="thorngate admin dashboard" width="800">
+</p>
+
 ```json
 "admin": {
   "enabled": true,
