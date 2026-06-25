@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,87 @@ type Blacklist struct {
 // isCIDR reports whether a ban key denotes a CIDR range rather than a single IP.
 func isCIDR(key string) bool { return strings.Contains(key, "/") }
 
+// ParseNets turns a list of address specs into matchable networks. Each spec may
+// be a single IP ("1.2.3.4"), a CIDR ("10.0.0.0/8"), or an octet wildcard
+// ("107.214.211.*" == "107.214.211.0/24", "107.214.*" == "107.214.0.0/16").
+// Surrounding whitespace is tolerated; unparseable specs are skipped.
+func ParseNets(specs []string) []*net.IPNet {
+	var nets []*net.IPNet
+	for _, s := range specs {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if c, ok := wildcardToCIDR(s); ok {
+			s = c
+		} else if !strings.Contains(s, "/") {
+			// Treat a bare address as a single host.
+			if strings.Contains(s, ":") {
+				s += "/128" // IPv6
+			} else {
+				s += "/32" // IPv4
+			}
+		}
+		if _, ipnet, err := net.ParseCIDR(s); err == nil {
+			nets = append(nets, ipnet)
+		}
+	}
+	return nets
+}
+
+// wildcardToCIDR converts an IPv4 octet-wildcard spec into a CIDR string. The
+// wildcard octets must be trailing and contiguous: "107.214.211.*" -> 24 bits,
+// "107.214.*" -> 16 bits. Returns ok=false for non-wildcard or malformed specs
+// (a leading "*", a "*" before a literal octet, or all octets wild).
+func wildcardToCIDR(s string) (string, bool) {
+	if !strings.Contains(s, "*") {
+		return "", false
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) > 4 {
+		return "", false
+	}
+	known, seenStar := 0, false
+	for _, p := range parts {
+		if p == "*" {
+			seenStar = true
+			continue
+		}
+		if seenStar {
+			return "", false // a literal octet after a wildcard is invalid
+		}
+		known++
+	}
+	if known == 0 || known > 3 {
+		return "", false
+	}
+	octets := make([]string, 4)
+	for i := 0; i < 4; i++ {
+		if i < known {
+			octets[i] = parts[i]
+		} else {
+			octets[i] = "0"
+		}
+	}
+	return strings.Join(octets, ".") + "/" + strconv.Itoa(known*8), true
+}
+
+// Matches reports whether ip falls within any of the given networks. It is a
+// free function so callers (e.g. the proxy's no-log set) can reuse ParseNets
+// without a Blacklist instance.
+func Matches(nets []*net.IPNet, ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
 // New creates a Blacklist, loading any previously persisted entries from file.
 // whitelist accepts plain IPs ("1.2.3.4") or CIDRs ("10.0.0.0/8").
 func New(file string, whitelist []string) (*Blacklist, error) {
@@ -57,21 +139,7 @@ func New(file string, whitelist []string) (*Blacklist, error) {
 		file:    file,
 	}
 
-	for _, w := range whitelist {
-		if !strings.Contains(w, "/") {
-			// Treat a bare address as a single host.
-			if strings.Contains(w, ":") {
-				w += "/128" // IPv6
-			} else {
-				w += "/32" // IPv4
-			}
-		}
-		_, ipnet, err := net.ParseCIDR(w)
-		if err != nil {
-			continue
-		}
-		b.whitelist = append(b.whitelist, ipnet)
-	}
+	b.whitelist = ParseNets(whitelist)
 
 	if file != "" {
 		if data, err := os.ReadFile(file); err == nil {
@@ -141,16 +209,7 @@ func (b *Blacklist) List() []Entry {
 
 // IsWhitelisted reports whether an IP should never be blacklisted.
 func (b *Blacklist) IsWhitelisted(ip string) bool {
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		return false
-	}
-	for _, n := range b.whitelist {
-		if n.Contains(parsed) {
-			return true
-		}
-	}
-	return false
+	return Matches(b.whitelist, ip)
 }
 
 // Add permanently blacklists an IP or CIDR range (e.g. "1.2.3.4" or

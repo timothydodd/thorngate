@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func mustCompile(t *testing.T, h Honeypot) Honeypot {
 	t.Helper()
@@ -109,5 +112,33 @@ func TestHoneypotUnmarshalShorthand(t *testing.T) {
 	}
 	if h.Pattern != "/wp-admin" || h.Match != "prefix" {
 		t.Errorf("got %+v, want prefix /wp-admin", h)
+	}
+}
+
+func TestWhitelistEntryUnmarshal(t *testing.T) {
+	var c Config
+	js := `{"whitelist":["1.2.3.4","107.214.211.0/24",{"ip":"9.9.9.0/24","no_log":true}]}`
+	if err := json.Unmarshal([]byte(js), &c); err != nil {
+		t.Fatal(err)
+	}
+	want := []WhitelistEntry{
+		{IP: "1.2.3.4", NoLog: false},
+		{IP: "107.214.211.0/24", NoLog: false},
+		{IP: "9.9.9.0/24", NoLog: true},
+	}
+	if len(c.Whitelist) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(c.Whitelist), len(want))
+	}
+	for i, e := range c.Whitelist {
+		if e != want[i] {
+			t.Errorf("entry %d = %+v, want %+v", i, e, want[i])
+		}
+	}
+	if specs := c.WhitelistSpecs(); len(specs) != 3 {
+		t.Errorf("WhitelistSpecs = %v, want 3 entries", specs)
+	}
+	noLog := c.NoLogSpecs()
+	if len(noLog) != 1 || noLog[0] != "9.9.9.0/24" {
+		t.Errorf("NoLogSpecs = %v, want [9.9.9.0/24]", noLog)
 	}
 }

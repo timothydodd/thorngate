@@ -29,9 +29,12 @@ type Config struct {
 	// Any external IP that matches one is blacklisted immediately.
 	Honeypots []Honeypot `json:"honeypots"`
 
-	// Whitelist are IPs (or CIDRs) that are never blacklisted, e.g. your own
-	// office IP or health-check sources.
-	Whitelist []string `json:"whitelist"`
+	// Whitelist are IPs that are never blacklisted, e.g. your own office IP or
+	// health-check sources. Each entry may be a single IP ("1.2.3.4"), a CIDR
+	// ("10.0.0.0/8"), or an octet wildcard ("107.214.211.*"). An entry may also
+	// be an object to set per-entry options, e.g.
+	// { "ip": "107.214.211.*", "no_log": true }.
+	Whitelist []WhitelistEntry `json:"whitelist"`
 
 	// Upstream is the default internal target that ALL traffic is proxied to
 	// unless a hostname route below matches. Accepts an IP/host with optional
@@ -208,6 +211,58 @@ type Route struct {
 	// Upstream is the internal target for this host. Same format as the
 	// top-level Upstream (IP / host:port / full URL; scheme defaults to http).
 	Upstream string `json:"upstream"`
+}
+
+// WhitelistEntry is a single whitelist rule. In JSON it may be either:
+//
+//	"107.214.211.*"                                 // shorthand: just the address
+//	{ "ip": "107.214.211.*", "no_log": true }       // address plus options
+//
+// IP accepts a single IP, a CIDR, or an octet wildcard. NoLog, when set, also
+// excludes the matched IPs from request logging and traffic stats (handy for
+// your own monitors / health checks that would otherwise clutter the feed).
+type WhitelistEntry struct {
+	IP    string `json:"ip"`
+	NoLog bool   `json:"no_log"`
+}
+
+// UnmarshalJSON lets a whitelist entry be a bare string or a full object.
+func (e *WhitelistEntry) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		e.IP = s
+		e.NoLog = false
+		return nil
+	}
+	type raw WhitelistEntry // avoid recursing into this method
+	var r raw
+	if err := json.Unmarshal(b, &r); err != nil {
+		return err
+	}
+	*e = WhitelistEntry(r)
+	return nil
+}
+
+// WhitelistSpecs returns the address specs of every whitelist entry, for
+// building the never-blacklist set.
+func (c *Config) WhitelistSpecs() []string {
+	specs := make([]string, 0, len(c.Whitelist))
+	for _, e := range c.Whitelist {
+		specs = append(specs, e.IP)
+	}
+	return specs
+}
+
+// NoLogSpecs returns the address specs of whitelist entries flagged no_log, for
+// building the set of IPs excluded from logging and stats.
+func (c *Config) NoLogSpecs() []string {
+	var specs []string
+	for _, e := range c.Whitelist {
+		if e.NoLog {
+			specs = append(specs, e.IP)
+		}
+	}
+	return specs
 }
 
 // Honeypot is a request matcher. In JSON it may be either:

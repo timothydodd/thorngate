@@ -27,6 +27,7 @@ type WAF struct {
 	mon    *monitor.Monitor       // nil unless temp_ban is enabled
 	hist   *history.Tracker       // nil unless request_log is enabled
 	stats  *stats.Collector       // nil unless stats is enabled
+	noLog  []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
 }
 
 type hostRoute struct {
@@ -36,7 +37,7 @@ type hostRoute struct {
 
 // New builds the WAF handler from config and a blacklist store.
 func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
-	w := &WAF{cfg: cfg, bl: bl}
+	w := &WAF{cfg: cfg, bl: bl, noLog: blacklist.ParseNets(cfg.NoLogSpecs())}
 
 	def, err := newProxy(cfg.Upstream)
 	if err != nil {
@@ -100,6 +101,11 @@ func newProxy(upstream string) (*httputil.ReverseProxy, error) {
 func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	ip := w.clientIP(r)
 
+	// no_log whitelist entries (e.g. your own monitors) are kept out of the
+	// stats feed and request history entirely. They can never be blacklisted,
+	// so blacklist/honeypot/temp-ban bookkeeping is irrelevant for them too.
+	quiet := len(w.noLog) > 0 && blacklist.Matches(w.noLog, ip)
+
 	// 1. Already blacklisted? Hard 403, no upstream contact.
 	if w.bl.IsBlocked(ip) {
 		if w.stats != nil {
@@ -109,7 +115,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		forbidden(rw)
 		return
 	}
-	if w.stats != nil {
+	if w.stats != nil && !quiet {
 		w.stats.Request(false)
 	}
 
@@ -123,7 +129,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				w.stats.Honeypot()
 			}
 		}
-		if w.stats != nil {
+		if w.stats != nil && !quiet {
 			w.observe(ip, r, http.StatusForbidden, "honeypot")
 		}
 		forbidden(rw)
@@ -133,9 +139,9 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// 3. Hostname override? Otherwise fall through to the default upstream.
 	up := w.upstreamFor(r)
 
-	// With no response-inspecting feature enabled, proxy directly with no
-	// response wrapping.
-	if w.mon == nil && w.hist == nil && w.stats == nil {
+	// With no response-inspecting feature enabled (or a quiet no_log IP), proxy
+	// directly with no response wrapping.
+	if quiet || (w.mon == nil && w.hist == nil && w.stats == nil) {
 		up.ServeHTTP(rw, r)
 		return
 	}

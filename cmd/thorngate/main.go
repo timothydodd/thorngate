@@ -26,7 +26,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	bl, err := blacklist.New(cfg.BlacklistFile, cfg.Whitelist)
+	bl, err := blacklist.New(cfg.BlacklistFile, cfg.WhitelistSpecs())
 	if err != nil {
 		log.Fatalf("blacklist: %v", err)
 	}

@@ -29,7 +29,7 @@ func newWAF(t *testing.T, backend http.HandlerFunc, extra string) (*WAF, *blackl
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	bl, err := blacklist.New("", cfg.Whitelist)
+	bl, err := blacklist.New("", cfg.WhitelistSpecs())
 	if err != nil {
 		t.Fatal(err)
 	}

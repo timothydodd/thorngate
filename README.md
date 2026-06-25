@@ -52,7 +52,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `listen` | listen address, default `:8765` |
 | `client_ip_header` | header with the real IP — `Cf-Connecting-Ip` for Cloudflare |
 | `blacklist_file` | where to persist blocked IPs (mount a volume in k8s) |
-| `whitelist` | IPs/CIDRs never blacklisted (your own IP, internal ranges) |
+| `whitelist` | IPs never blacklisted (your own IP, internal ranges) — see below |
 | `honeypots` | patterns that trigger an instant blacklist (see below) |
 | `upstream` | **default** internal target for all traffic (IP / host:port / URL) |
 | `routes` | optional `host` → `upstream` overrides (see Routing below) |
@@ -60,6 +60,26 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `admin` | optional token-protected admin API + web page (see below) |
 | `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
 | `stats` | in-memory traffic counters for the admin dashboard (on by default, see below) |
+
+### Whitelist (`whitelist`)
+
+IPs listed here are **never** blacklisted — not by a honeypot hit, not by a temp-ban, and not even if they fall inside a banned CIDR range. Whitelist your own admin IP and internal ranges so you can't lock yourself out.
+
+Each entry is either a **bare string** or an **object**. The address may be a single IP, a CIDR, or an octet wildcard:
+
+```json
+"whitelist": [
+  "9.9.9.9",                                   // single IP
+  "107.214.211.0/24",                          // CIDR — the standard way to whitelist a range
+  "107.214.211.*",                             // wildcard sugar — same as 107.214.211.0/24
+  "107.214.*",                                 // wildcard for a /16
+  { "ip": "10.0.0.0/8", "no_log": true }       // object form: also keep this range out of logs
+]
+```
+
+A range like `107.214.211.0/24` covers `107.214.211.0`–`107.214.211.255`. The wildcard forms are just shorthand: `107.214.211.*` → `/24`, `107.214.*` → `/16`, `107.*` → `/8` (the `*`s must be the trailing octets).
+
+Set **`no_log`** on an entry (object form) to also exclude its traffic from the **stats dashboard** and **request history** entirely. Use it for your own health checks / uptime monitors that would otherwise flood the live feed. A `no_log` IP is proxied straight through with no response wrapping, so it adds zero per-request overhead.
 
 ### Honeypot matching
 

@@ -48,6 +48,50 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestWildcardWhitelist(t *testing.T) {
+	// "107.214.211.*" should behave like "107.214.211.0/24".
+	bl := newBL(t, []string{" 107.214.211.* ", "107.215.*"})
+	cases := []struct {
+		ip   string
+		want bool
+	}{
+		{"107.214.211.0", true},
+		{"107.214.211.45", true},
+		{"107.214.211.255", true},
+		{"107.214.212.1", false}, // next /24, not covered
+		{"107.215.9.9", true},    // /16 wildcard
+		{"107.216.0.1", false},
+	}
+	for _, c := range cases {
+		if got := bl.IsWhitelisted(c.ip); got != c.want {
+			t.Errorf("IsWhitelisted(%q) = %v, want %v", c.ip, got, c.want)
+		}
+	}
+}
+
+func TestWildcardToCIDR(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"107.214.211.*", "107.214.211.0/24", true},
+		{"107.214.*", "107.214.0.0/16", true},
+		{"107.*", "107.0.0.0/8", true},
+		{"107.214.211.0/24", "", false}, // already CIDR, not a wildcard
+		{"1.2.3.4", "", false},          // no wildcard
+		{"*", "", false},                // all wild — rejected
+		{"*.2.3.4", "", false},          // leading wildcard — rejected
+		{"1.*.3.4", "", false},          // literal after wildcard — rejected
+	}
+	for _, c := range cases {
+		got, ok := wildcardToCIDR(c.in)
+		if ok != c.ok || got != c.want {
+			t.Errorf("wildcardToCIDR(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
 func TestWhitelistPreventsAdd(t *testing.T) {
 	bl := newBL(t, []string{"9.9.9.9", "10.0.0.0/8"})
 	if bl.Add("9.9.9.9", "honeypot", "") {
