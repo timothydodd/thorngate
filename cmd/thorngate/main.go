@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"thorngate/internal/admin"
+	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
 	"thorngate/internal/proxy"
@@ -61,9 +62,13 @@ func main() {
 	// Optional admin API + web page on a separate, cluster-internal port.
 	var adminSrv *http.Server
 	if cfg.Admin != nil && cfg.Admin.Enabled {
+		au, err := auth.New(cfg.Admin.CredentialsFile)
+		if err != nil {
+			log.Fatalf("admin credentials: %v", err)
+		}
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
-			Handler:           admin.Handler(bl, waf.Stats(), cfg.Admin.Token),
+			Handler:           admin.Handler(bl, waf.Stats(), au, cfg.Admin.Token),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {

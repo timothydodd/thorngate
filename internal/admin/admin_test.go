@@ -1,15 +1,18 @@
 package admin
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/stats"
 )
 
+// token is the legacy API token, still accepted alongside session logins.
 const token = "secret-token"
 
 func newServer(t *testing.T) (*httptest.Server, *blacklist.Blacklist) {
@@ -18,7 +21,11 @@ func newServer(t *testing.T) (*httptest.Server, *blacklist.Blacklist) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return httptest.NewServer(Handler(bl, stats.New(60, 100), token)), bl
+	au, err := auth.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return httptest.NewServer(Handler(bl, stats.New(60, 100), au, token)), bl
 }
 
 func do(t *testing.T, srv *httptest.Server, method, path, body, tok string) *http.Response {
@@ -100,7 +107,47 @@ func TestPageServedWithoutAuth(t *testing.T) {
 	srv, _ := newServer(t)
 	defer srv.Close()
 
-	if res := do(t, srv, "GET", "/admin/", "", ""); res.StatusCode != http.StatusOK {
+	// The SPA (index.html) is served for any non-API path, unauthenticated.
+	if res := do(t, srv, "GET", "/", "", ""); res.StatusCode != http.StatusOK {
 		t.Errorf("page: got %d, want 200", res.StatusCode)
+	}
+}
+
+func TestLoginFlow(t *testing.T) {
+	srv, _ := newServer(t)
+	defer srv.Close()
+
+	// Wrong credentials are rejected.
+	if res := do(t, srv, "POST", "/admin/login", `{"username":"admin","password":"nope"}`, ""); res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad login: got %d, want 401", res.StatusCode)
+	}
+
+	// Default admin/admin succeeds and returns a session token.
+	res := do(t, srv, "POST", "/admin/login", `{"username":"admin","password":"admin"}`, "")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("login: got %d, want 200", res.StatusCode)
+	}
+	var out struct {
+		Token    string `json:"token"`
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Token == "" {
+		t.Fatal("expected a session token")
+	}
+
+	// The session token authorizes API calls.
+	if r := do(t, srv, "GET", "/admin/blacklist", "", out.Token); r.StatusCode != http.StatusOK {
+		t.Errorf("session auth: got %d, want 200", r.StatusCode)
+	}
+
+	// Logout invalidates it.
+	if r := do(t, srv, "POST", "/admin/logout", "", out.Token); r.StatusCode != http.StatusOK {
+		t.Errorf("logout: got %d, want 200", r.StatusCode)
+	}
+	if r := do(t, srv, "GET", "/admin/blacklist", "", out.Token); r.StatusCode != http.StatusUnauthorized {
+		t.Errorf("post-logout: got %d, want 401", r.StatusCode)
 	}
 }

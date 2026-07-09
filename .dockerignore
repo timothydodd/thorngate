@@ -1,0 +1,12 @@
+# Keep the build context lean. The portal is embedded from internal/admin/dist
+# (which IS copied); the web/ source and its node_modules are not needed to build
+# the Go binary.
+.git
+web/node_modules
+web/dist
+*.tmp
+blacklist.json
+admin_credentials.json
+data/
+thorngate
+appicon.png

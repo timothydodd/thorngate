@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="thorngate logo" width="160">
+  <img src="assets/appicon.png" alt="thorngate logo" width="160">
 </p>
 
 # thorngate
@@ -37,8 +37,10 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 │   ├── monitor/          # per-IP sliding-window strike counter (temp bans)
 │   ├── history/          # bounded per-IP request history (dumped on ban)
 │   ├── stats/            # in-memory traffic counters for the dashboard
-│   ├── admin/            # token-protected admin API + web page
+│   ├── auth/             # admin credential store (PBKDF2) + sessions
+│   ├── admin/            # admin API + embedded React portal (internal/admin/dist)
 │   └── proxy/            # IP extraction, honeypot check, host routing
+├── web/                  # React + Vite source for the portal (built into admin/dist)
 ├── deploy/k3s/           # k3s manifests (ConfigMap, PVC, Deployment, Service)
 ├── .github/workflows/    # ci.yml (build/vet/test) + release.yml (GHCR image)
 ├── Dockerfile            # distroless, multi-arch
@@ -57,7 +59,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `upstream` | **default** internal target for all traffic (IP / host:port / URL) |
 | `routes` | optional `host` → `upstream` overrides (see Routing below) |
 | `temp_ban` | optional auto-ban for too many bad responses (see below) |
-| `admin` | optional token-protected admin API + web page (see below) |
+| `admin` | optional login-protected admin portal + API on a separate port (see below) |
 | `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
 | `stats` | in-memory traffic counters for the admin dashboard (on by default, see below) |
 
@@ -205,9 +207,13 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 - Counters live in memory only — they are **not** persisted and reset to zero on restart.
 - Read them programmatically via `GET /admin/stats` (same bearer token as the rest of the admin API).
 
-### Managing the blacklist (`admin`)
+### Admin portal (`admin`)
 
-An optional admin endpoint on a **separate port** lets you view, add, and remove blocked IPs live (changes hit the in-memory store and are persisted immediately — no restart). It serves both a JSON API and a single self-contained web page. The page has two tabs: a **Dashboard** with traffic stats (see `stats` below) and the **Blacklist** manager. It auto-refreshes every 10s and styles itself with [Tailwind](https://tailwindcss.com) via the Play CDN — the page is loaded in your own browser over the port-forward, so the CDN fetch happens browser-side; the thorngate binary itself stays dependency-free and offline-buildable.
+An optional admin server on a **separate port** hosts the portal: a **React single-page app** (embedded into the binary via `go:embed`, so no CDN and no runtime dependencies) plus the JSON API it talks to. It lets you view traffic and add/remove blocked IPs live — changes hit the in-memory store and are persisted immediately, no restart. Three tabs:
+
+- **Dashboard** — traffic stats (see `stats` above), a per-minute requests-vs-blocked chart, and a live feed of recent requests. Each row has a **Details** button that opens the full request (host, path, query, resolved upstream, status, outcome).
+- **Blacklist** — add/remove bans (single IP or CIDR).
+- **Settings** — change the admin password.
 
 <p align="center">
   <img src="assets/screenshot.jpg" alt="thorngate admin dashboard" width="800">
@@ -217,36 +223,54 @@ An optional admin endpoint on a **separate port** lets you view, add, and remove
 "admin": {
   "enabled": true,
   "listen": ":9000",
-  "token": "change-me-locally"
+  "credentials_file": "/data/admin_credentials.json",
+  "token": "optional-legacy-api-token"
 }
 ```
 
-- `token` is required as `Authorization: Bearer <token>` on every API call. Leave it empty in the config to read it from the **`THORNGATE_ADMIN_TOKEN`** env var instead (the k8s manifest wires this from a Secret).
+- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`; point it at a persistent volume so the change survives restarts). Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart.
+- **`token`** is an **optional** legacy bearer token for scripted/API access, accepted alongside interactive login. Leave it empty (or set it via **`THORNGATE_ADMIN_TOKEN`**) to disable it and rely solely on login.
 - **Keep this port cluster-internal — never attach it to the Cloudflare tunnel.** In k3s it's a separate ClusterIP `Service` (`thorngate-admin`); reach it with port-forward.
 
 ```bash
 kubectl -n thorngate port-forward svc/thorngate-admin 9000:9000
-# then open http://localhost:9000/admin/ and paste your token
+# then open http://localhost:9000/ and sign in (default admin / admin)
 ```
 
-API (constant-time token check; the HTML page carries no secret and prompts for the token, storing it in localStorage):
+API (session token from `/admin/login`, or the legacy bearer token, sent as `Authorization: Bearer <token>`):
 
 | method | path | body | action |
 |--------|------|------|--------|
+| `POST` | `/admin/login` | `{"username":"...","password":"..."}` | log in → `{"token":"...","username":"..."}` |
+| `POST` | `/admin/logout` | — | invalidate the current session |
+| `GET` | `/admin/me` | — | current username (validates the session) |
+| `POST` | `/admin/password` | `{"current_password":"...","new_password":"..."}` | change the admin password |
 | `GET` | `/admin/blacklist` | — | list all entries (JSON) |
 | `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP or CIDR range |
 | `DELETE` | `/admin/blacklist/{key}` | — | unban an IP or CIDR range |
 | `GET` | `/admin/stats` | — | traffic counters + per-minute series (JSON; `{"enabled":false}` if stats are off) |
-| `GET` | `/admin/` | — | the web page |
+| `GET` | `/` (+ assets) | — | the React portal |
 
 The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range.
 
 ```bash
-TOKEN=change-me-locally
+# Log in and reuse the session token, or set TOKEN to your legacy admin.token.
+TOKEN=$(curl -s -d '{"username":"admin","password":"admin"}' localhost:9000/admin/login | sed 's/.*"token":"\([^"]*\)".*/\1/')
 curl -H "Authorization: Bearer $TOKEN" localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.4"}' localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.0/24"}' localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -X DELETE localhost:9000/admin/blacklist/1.2.3.4
+```
+
+#### Rebuilding the portal
+
+The built app lives in `internal/admin/dist/` and is committed, so `go build` needs no Node toolchain. To change the UI, edit the source under `web/` and rebuild:
+
+```bash
+cd web
+npm install        # first time only
+npm run build      # type-checks, then builds straight into internal/admin/dist/
+npm run dev        # optional: Vite dev server on :5173, proxying /admin to :9000
 ```
 
 ## Run locally

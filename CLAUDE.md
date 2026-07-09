@@ -37,7 +37,8 @@ The whole request lifecycle lives in `internal/proxy/proxy.go` (`WAF.ServeHTTP`)
 - **`internal/blacklist`** — thread-safe store with atomic file persistence (temp file + fsync + rename). Two backing structures: exact IPs in a map (O(1)), CIDR ranges in a slice matched by `net.Contains`. A key containing `/` is treated as a CIDR. Temp vs permanent reconciliation matters: a permanent ban outranks/upgrades a temporary one, and whitelisted IPs are never blocked even inside a banned range. CIDR bans are **manual only** (admin API / config) — honeypots and temp-bans only ever ban single IPs.
 - **`internal/monitor`** — per-IP sliding-window strike counter backing temp-bans. Swept periodically.
 - **`internal/history`** — bounded in-memory ring buffer (per-IP `depth` × `max_ips`, TTL-swept) of recent requests, dumped to the log when an IP is blacklisted. Memory-only, never persisted.
-- **`internal/admin`** — optional token-protected API + self-contained web page on a **separate port**, for live blacklist management. Never attach this port to the tunnel.
+- **`internal/admin`** — optional login-protected admin portal on a **separate port**: the JSON API plus a **React SPA embedded via `go:embed` from `internal/admin/dist`** (built from `web/` — run `npm run build` there to refresh it; `go build` needs no Node because `dist` is committed). Never attach this port to the tunnel. Auth is session-based (see `internal/auth`); a legacy static `admin.token` is still accepted for scripted access.
+- **`internal/auth`** — admin credential store: one username + salted **PBKDF2-HMAC-SHA256** password hash, persisted atomically (same temp-file+fsync+rename pattern as the blacklist), plus in-memory session tokens. Seeds **admin/admin** on a fresh install. PBKDF2 is hand-implemented (stdlib `crypto/hmac`+`crypto/sha256`) because `crypto/pbkdf2` postdates this module's Go 1.22 target — keep it stdlib-only.
 
 ### Conventions worth preserving
 

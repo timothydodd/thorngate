@@ -25,7 +25,7 @@
   "admin": {
     "enabled": true,
     "listen": ":9000",
-    "token": "change-me-locally"
+    "credentials_file": "admin_credentials.json"
   },
   "stats": {
     "disabled": false,

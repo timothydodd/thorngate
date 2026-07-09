@@ -136,14 +136,22 @@ func (r *RequestLog) Enabled() bool { return !r.Disabled }
 // TTLDur returns the parsed idle-eviction window.
 func (r *RequestLog) TTLDur() time.Duration { return r.ttl }
 
-// Admin configures the blacklist management endpoint.
+// Admin configures the admin portal (React SPA + JSON API).
 type Admin struct {
 	Enabled bool `json:"enabled"`
 	// Listen is the admin port, default ":9000". Keep it cluster-internal.
 	Listen string `json:"listen"`
-	// Token is the bearer token required by the API. If empty, it falls back
-	// to the THORNGATE_ADMIN_TOKEN environment variable (prefer a k8s Secret).
+	// Token is an OPTIONAL legacy bearer token accepted by the API for scripted
+	// access, alongside interactive login. If empty, it falls back to the
+	// THORNGATE_ADMIN_TOKEN environment variable. Leave unset to disable it and
+	// rely solely on username/password login.
 	Token string `json:"token"`
+	// CredentialsFile is where the admin username + hashed password are stored.
+	// Defaults to "admin_credentials.json". A fresh file is seeded with
+	// admin/admin; change the password from the portal's Settings tab. Point it
+	// at a persistent volume (e.g. /data/admin_credentials.json) so the change
+	// survives restarts.
+	CredentialsFile string `json:"credentials_file"`
 }
 
 // TempBan auto-bans IPs that generate too many bad responses (e.g. scanners
@@ -418,8 +426,8 @@ func Load(filePath string) (*Config, error) {
 		if c.Admin.Token == "" {
 			c.Admin.Token = os.Getenv("THORNGATE_ADMIN_TOKEN")
 		}
-		if c.Admin.Token == "" {
-			return nil, fmt.Errorf("config: admin enabled but no token (set admin.token or THORNGATE_ADMIN_TOKEN)")
+		if c.Admin.CredentialsFile == "" {
+			c.Admin.CredentialsFile = "admin_credentials.json"
 		}
 	}
 

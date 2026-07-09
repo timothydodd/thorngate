@@ -13,9 +13,38 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
+      # The Go build embeds the committed portal at internal/admin/dist
+      # (go:embed), so no Node toolchain is needed here.
       - name: go vet
         run: go vet ./...
       - name: build
         run: go build ./...
       - name: test
         run: go test ./...
+
+  # Type-check and build the React portal so UI breakage is caught. The built
+  # output (internal/admin/dist) is committed and consumed by the go job above;
+  # after changing anything under web/, run `npm run build` and commit the dist.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: install
+        run: npm ci
+      - name: build (tsc + vite)
+        run: npm run build
+      - name: verify committed dist is up to date
+        run: |
+          if ! git diff --quiet -- ../internal/admin/dist; then
+            echo "::error::internal/admin/dist is out of date — run 'npm run build' in web/ and commit the result."
+            git --no-pager diff --stat -- ../internal/admin/dist
+            exit 1
+          fi

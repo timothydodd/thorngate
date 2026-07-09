@@ -1,4 +1,10 @@
 /thorngate
 *.tmp
 blacklist.json
+admin_credentials.json
 /data/
+
+# Portal build tooling. The built output (internal/admin/dist) IS committed so
+# `go build` works without Node; only node_modules is ignored.
+/web/node_modules/
+/web/dist/
