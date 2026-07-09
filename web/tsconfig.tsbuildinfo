@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/Blacklist.tsx","./src/components/Dashboard.tsx","./src/components/DetailsModal.tsx","./src/components/Login.tsx","./src/components/Settings.tsx","./src/components/TrafficChart.tsx","./src/components/badges.tsx"],"errors":true,"version":"5.9.3"}
