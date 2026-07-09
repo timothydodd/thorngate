@@ -20,37 +20,39 @@ import (
 // WAF is an http.Handler that blacklists honeypot hitters and reverse-proxies
 // everything else to the default upstream (or a hostname override).
 type WAF struct {
-	cfg    *config.Config
-	bl     *blacklist.Blacklist
-	def    *httputil.ReverseProxy // default upstream for all traffic
-	routes []hostRoute            // optional hostname overrides
-	mon    *monitor.Monitor       // nil unless temp_ban is enabled
-	hist   *history.Tracker       // nil unless request_log is enabled
-	stats  *stats.Collector       // nil unless stats is enabled
-	noLog  []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
+	cfg       *config.Config
+	bl        *blacklist.Blacklist
+	def       *httputil.ReverseProxy // default upstream for all traffic
+	defTarget string                 // resolved default upstream URL, for logging
+	routes    []hostRoute            // optional hostname overrides
+	mon       *monitor.Monitor       // nil unless temp_ban is enabled
+	hist      *history.Tracker       // nil unless request_log is enabled
+	stats     *stats.Collector       // nil unless stats is enabled
+	noLog     []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
 }
 
 type hostRoute struct {
-	route config.Route
-	proxy *httputil.ReverseProxy
+	route  config.Route
+	proxy  *httputil.ReverseProxy
+	target string // resolved upstream URL, for logging
 }
 
 // New builds the WAF handler from config and a blacklist store.
 func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 	w := &WAF{cfg: cfg, bl: bl, noLog: blacklist.ParseNets(cfg.NoLogSpecs())}
 
-	def, err := newProxy(cfg.Upstream)
+	def, defTarget, err := newProxy(cfg.Upstream)
 	if err != nil {
 		return nil, err
 	}
-	w.def = def
+	w.def, w.defTarget = def, defTarget
 
 	for _, r := range cfg.Routes {
-		rp, err := newProxy(r.Upstream)
+		rp, target, err := newProxy(r.Upstream)
 		if err != nil {
 			return nil, err
 		}
-		w.routes = append(w.routes, hostRoute{route: r, proxy: rp})
+		w.routes = append(w.routes, hostRoute{route: r, proxy: rp, target: target})
 	}
 
 	if cfg.TempBan != nil && cfg.TempBan.Enabled {
@@ -84,18 +86,20 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 // portal reads it to render the dashboard.
 func (w *WAF) Stats() *stats.Collector { return w.stats }
 
-// newProxy builds a single-host reverse proxy for an upstream config value.
-func newProxy(upstream string) (*httputil.ReverseProxy, error) {
+// newProxy builds a single-host reverse proxy for an upstream config value. It
+// also returns the resolved target URL so requests can be logged with the
+// upstream they were routed to.
+func newProxy(upstream string) (*httputil.ReverseProxy, string, error) {
 	target, err := config.ParseUpstream(upstream)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	rp := httputil.NewSingleHostReverseProxy(target)
 	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		log.Printf("upstream error host=%s path=%s: %v", req.Host, req.URL.Path, err)
+		log.Printf("upstream error host=%s path=%s upstream=%s: %v", req.Host, req.URL.Path, target, err)
 		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
 	}
-	return rp, nil
+	return rp, target.String(), nil
 }
 
 func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
@@ -110,7 +114,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if w.bl.IsBlocked(ip) {
 		if w.stats != nil {
 			w.stats.Request(true)
-			w.observe(ip, r, http.StatusForbidden, "blocked")
+			w.observe(ip, r, http.StatusForbidden, "blocked", "")
 		}
 		forbidden(rw)
 		return
@@ -130,14 +134,14 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if w.stats != nil && !quiet {
-			w.observe(ip, r, http.StatusForbidden, "honeypot")
+			w.observe(ip, r, http.StatusForbidden, "honeypot", "")
 		}
 		forbidden(rw)
 		return
 	}
 
 	// 3. Hostname override? Otherwise fall through to the default upstream.
-	up := w.upstreamFor(r)
+	up, target := w.upstreamFor(r)
 
 	// With no response-inspecting feature enabled (or a quiet no_log IP), proxy
 	// directly with no response wrapping.
@@ -148,10 +152,10 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	sw := &statusWriter{ResponseWriter: rw, status: http.StatusOK}
 	up.ServeHTTP(sw, r)
-	w.recordRequest(ip, r, sw.status)
+	w.recordRequest(ip, r, sw.status, target)
 	if w.stats != nil {
 		w.stats.Status(sw.status)
-		w.observe(ip, r, sw.status, "proxied")
+		w.observe(ip, r, sw.status, "proxied", target)
 	}
 	if w.mon != nil {
 		w.monitorResponse(ip, sw.status)
@@ -159,33 +163,37 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 // observe records a request in the stats recent-requests feed. Caller has
-// already checked w.stats != nil.
-func (w *WAF) observe(ip string, r *http.Request, status int, outcome string) {
+// already checked w.stats != nil. upstream is empty when the request never
+// reached one (blocked / honeypot).
+func (w *WAF) observe(ip string, r *http.Request, status int, outcome, upstream string) {
 	w.stats.Observe(stats.Event{
-		Time:    time.Now().UTC(),
-		IP:      ip,
-		Method:  r.Method,
-		Host:    r.Host,
-		Path:    r.URL.Path,
-		Status:  status,
-		Outcome: outcome,
+		Time:     time.Now().UTC(),
+		IP:       ip,
+		Method:   r.Method,
+		Host:     r.Host,
+		Path:     r.URL.Path,
+		Query:    r.URL.RawQuery,
+		Status:   status,
+		Outcome:  outcome,
+		Upstream: upstream,
 	})
 }
 
 // recordRequest remembers a request that reached an upstream so it can be
 // dumped for context if this IP is later blacklisted. No-op when disabled.
-func (w *WAF) recordRequest(ip string, r *http.Request, status int) {
+func (w *WAF) recordRequest(ip string, r *http.Request, status int, upstream string) {
 	if w.hist == nil {
 		return
 	}
 	w.hist.Record(ip, history.Record{
-		Time:   time.Now().UTC(),
-		Method: r.Method,
-		Host:   r.Host,
-		Path:   r.URL.Path,
-		Query:  r.URL.RawQuery,
-		UA:     r.UserAgent(),
-		Status: status,
+		Time:     time.Now().UTC(),
+		Method:   r.Method,
+		Host:     r.Host,
+		Path:     r.URL.Path,
+		Query:    r.URL.RawQuery,
+		UA:       r.UserAgent(),
+		Status:   status,
+		Upstream: upstream,
 	})
 }
 
@@ -198,20 +206,23 @@ func (w *WAF) dumpHistory(ip, reason string) {
 	}
 	recs := w.hist.History(ip)
 	for i, rec := range recs {
-		log.Printf("  history ip=%s reason=%s %d/%d at=%s method=%s host=%q path=%q query=%q status=%d ua=%q",
+		log.Printf("  history ip=%s reason=%s %d/%d at=%s method=%s host=%q path=%q query=%q upstream=%q status=%d ua=%q",
 			ip, reason, i+1, len(recs), rec.Time.Format(time.RFC3339),
-			rec.Method, rec.Host, rec.Path, rec.Query, rec.Status, rec.UA)
+			rec.Method, rec.Host, rec.Path, rec.Query, rec.Upstream, rec.Status, rec.UA)
 	}
 	w.hist.Forget(ip)
 }
 
-func (w *WAF) upstreamFor(r *http.Request) *httputil.ReverseProxy {
+// upstreamFor picks the proxy for a request — the first route whose host
+// pattern matches, else the default upstream — and returns the resolved
+// upstream URL alongside it for logging.
+func (w *WAF) upstreamFor(r *http.Request) (*httputil.ReverseProxy, string) {
 	for i := range w.routes {
 		if w.routes[i].route.MatchHost(r.Host) {
-			return w.routes[i].proxy
+			return w.routes[i].proxy, w.routes[i].target
 		}
 	}
-	return w.def
+	return w.def, w.defTarget
 }
 
 // monitorResponse records a strike for bad responses and applies a temporary

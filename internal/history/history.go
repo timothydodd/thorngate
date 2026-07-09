@@ -11,13 +11,14 @@ import (
 
 // Record is a single proxied request remembered for forensic context.
 type Record struct {
-	Time   time.Time
-	Method string
-	Host   string
-	Path   string
-	Query  string
-	UA     string
-	Status int
+	Time     time.Time
+	Method   string
+	Host     string
+	Path     string
+	Query    string
+	UA       string
+	Status   int
+	Upstream string // resolved upstream URL the request was routed to
 }
 
 type entry struct {

@@ -35,13 +35,15 @@ type Collector struct {
 
 // Event is one observed request kept in the recent-requests feed.
 type Event struct {
-	Time    time.Time `json:"time"`
-	IP      string    `json:"ip"`
-	Method  string    `json:"method"`
-	Host    string    `json:"host"`
-	Path    string    `json:"path"`
-	Status  int       `json:"status"`
-	Outcome string    `json:"outcome"` // "proxied", "blocked", or "honeypot"
+	Time     time.Time `json:"time"`
+	IP       string    `json:"ip"`
+	Method   string    `json:"method"`
+	Host     string    `json:"host"`
+	Path     string    `json:"path"`
+	Query    string    `json:"query,omitempty"`
+	Status   int       `json:"status"`
+	Outcome  string    `json:"outcome"`            // "proxied", "blocked", or "honeypot"
+	Upstream string    `json:"upstream,omitempty"` // resolved upstream URL; empty when never proxied
 }
 
 // bucket holds one minute of the time series. min is the unix-minute the slot

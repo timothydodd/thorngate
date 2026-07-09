@@ -167,7 +167,8 @@ const page = `<!doctype html>
         <table class="w-full text-sm">
           <thead class="bg-slate-50 dark:bg-slate-900/60 text-slate-500 text-xs uppercase tracking-wide sticky top-0">
             <tr><th class="text-left font-medium px-4 py-2">Time</th><th class="text-left font-medium px-4 py-2">IP</th>
-            <th class="text-left font-medium px-4 py-2">Method</th><th class="text-left font-medium px-4 py-2">Path</th>
+            <th class="text-left font-medium px-4 py-2">Method</th><th class="text-left font-medium px-4 py-2">Host</th>
+            <th class="text-left font-medium px-4 py-2">Path</th><th class="text-left font-medium px-4 py-2">Upstream</th>
             <th class="text-left font-medium px-4 py-2">Status</th><th class="text-left font-medium px-4 py-2">Outcome</th></tr>
           </thead>
           <tbody id="recent-rows" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
@@ -268,17 +269,20 @@ function statusColor(code) {
 function renderRecent(list) {
   document.getElementById('recent-count').textContent = list.length ? list.length + ' shown (newest first)' : '';
   const rows = document.getElementById('recent-rows');
-  if (!list.length) { rows.innerHTML = '<tr><td colspan="6" class="px-4 py-3 text-slate-400">no requests yet</td></tr>'; return; }
-  rows.innerHTML = list.map(e =>
-    '<tr>' +
+  if (!list.length) { rows.innerHTML = '<tr><td colspan="8" class="px-4 py-3 text-slate-400">no requests yet</td></tr>'; return; }
+  rows.innerHTML = list.map(e => {
+    const pathFull = e.path + (e.query ? '?' + e.query : '');
+    return '<tr>' +
     '<td class="px-4 py-1.5 text-slate-400 whitespace-nowrap">' + new Date(e.time).toLocaleTimeString() + '</td>' +
     '<td class="px-4 py-1.5 font-mono whitespace-nowrap">' + esc(e.ip) + '</td>' +
     '<td class="px-4 py-1.5">' + esc(e.method) + '</td>' +
-    '<td class="px-4 py-1.5 font-mono max-w-xs truncate" title="' + esc(e.path) + '">' + esc(e.path) + '</td>' +
+    '<td class="px-4 py-1.5 font-mono max-w-[16rem] truncate" title="' + esc(e.host) + '">' + esc(e.host) + '</td>' +
+    '<td class="px-4 py-1.5 font-mono max-w-xs truncate" title="' + esc(pathFull) + '">' + esc(pathFull) + '</td>' +
+    '<td class="px-4 py-1.5 font-mono max-w-[16rem] truncate text-slate-500" title="' + esc(e.upstream) + '">' + (e.upstream ? esc(e.upstream) : '&mdash;') + '</td>' +
     '<td class="px-4 py-1.5 font-mono ' + statusColor(e.status) + '">' + e.status + '</td>' +
     '<td class="px-4 py-1.5">' + outcomeBadge(e.outcome) + '</td>' +
-    '</tr>'
-  ).join('');
+    '</tr>';
+  }).join('');
 }
 
 function drawChart(series) {

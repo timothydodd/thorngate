@@ -155,9 +155,9 @@ When an IP trips a honeypot (or a temp-ban), the requests it made *just before* 
 
 ```
 BLACKLISTED ip=9.9.9.9 honeypot=/wp-admin ua="curl/7.64.1" total=6
-  history ip=9.9.9.9 reason=honeypot 1/3 at=2026-06-14T12:34:55Z method=GET host="app.example.com" path="/" query="" status=200 ua="curl/7.64.1"
-  history ip=9.9.9.9 reason=honeypot 2/3 at=2026-06-14T12:34:56Z method=GET host="app.example.com" path="/robots.txt" query="" status=404 ua="curl/7.64.1"
-  history ip=9.9.9.9 reason=honeypot 3/3 at=2026-06-14T12:34:57Z method=GET host="app.example.com" path="/.env" query="" status=404 ua="curl/7.64.1"
+  history ip=9.9.9.9 reason=honeypot 1/3 at=2026-06-14T12:34:55Z method=GET host="app.example.com" path="/" query="" upstream="http://10.0.0.5:8080" status=200 ua="curl/7.64.1"
+  history ip=9.9.9.9 reason=honeypot 2/3 at=2026-06-14T12:34:56Z method=GET host="app.example.com" path="/robots.txt" query="" upstream="http://10.0.0.5:8080" status=404 ua="curl/7.64.1"
+  history ip=9.9.9.9 reason=honeypot 3/3 at=2026-06-14T12:34:57Z method=GET host="app.example.com" path="/.env" query="" upstream="http://10.0.0.5:8080" status=404 ua="curl/7.64.1"
 ```
 
 It is **on by default** with sensible bounds — disable or tune it with a `request_log` block:
@@ -184,7 +184,7 @@ It is **on by default** with sensible bounds — disable or tune it with a `requ
 
 ### Traffic stats (`stats`)
 
-thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, and a 2xx/3xx/4xx/5xx breakdown of proxied responses, plus a per-minute requests-vs-blocked chart and a **live feed of recent requests** (time, IP, method, path, status, and outcome — `proxied` / `blocked` / `honeypot`).
+thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, and a 2xx/3xx/4xx/5xx breakdown of proxied responses, plus a per-minute requests-vs-blocked chart and a **live feed of recent requests** (time, IP, method, host, path + query, the upstream it was routed to, status, and outcome — `proxied` / `blocked` / `honeypot`). The host and upstream columns make it easy to spot routing problems — e.g. a hostname that isn't matching its route and falling through to the default upstream.
 
 It is **on by default** — the headline totals are lock-free atomics and the time series is a small per-minute ring buffer, so the overhead is a few increments per request. Disable or tune it with a `stats` block:
 
