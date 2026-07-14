@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -63,6 +64,41 @@ func TestChangePassword(t *testing.T) {
 	}
 	if _, err := s.Login(DefaultUsername, "newsecret"); err != nil {
 		t.Errorf("new password should work: %v", err)
+	}
+}
+
+func TestNewFailsWhenFileUnwritable(t *testing.T) {
+	// Seeding into a directory that doesn't exist must fail loudly at startup,
+	// not leave a store whose password changes silently vanish on restart.
+	if _, err := New(filepath.Join(t.TempDir(), "missing-dir", "creds.json")); err == nil {
+		t.Error("New should error when the credentials file can't be written")
+	}
+}
+
+func TestChangePasswordRollsBackWhenPersistFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "creds-dir")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(filepath.Join(dir, "creds.json"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Remove the directory out from under the store so persist's temp-file
+	// creation fails (works on both Unix and Windows, unlike chmod tricks).
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ChangePassword(DefaultPassword, "newsecret"); err == nil {
+		t.Fatal("ChangePassword should error when the file can't be written")
+	}
+	// The failed change must roll back: the old password still works.
+	if _, err := s.Login(DefaultUsername, DefaultPassword); err != nil {
+		t.Errorf("old password should still work after failed change: %v", err)
+	}
+	if _, err := s.Login(DefaultUsername, "newsecret"); err != ErrBadCredentials {
+		t.Error("new password should not work after failed change")
 	}
 }
 

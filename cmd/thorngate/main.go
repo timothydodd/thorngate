@@ -37,6 +37,23 @@ func main() {
 		log.Fatalf("proxy: %v", err)
 	}
 
+	// Optional stats persistence: pull the previous run's counters and recent
+	// requests back in, then re-save on an interval (and once more on shutdown).
+	statsFile := ""
+	if st := waf.Stats(); st != nil && cfg.Stats.File != "" {
+		statsFile = cfg.Stats.File
+		if err := st.Load(statsFile); err != nil {
+			log.Printf("stats: load %s: %v (starting fresh)", statsFile, err)
+		}
+		go func() {
+			for range time.Tick(cfg.Stats.SaveIntervalDur()) {
+				if err := st.Save(statsFile); err != nil {
+					log.Printf("stats: save %s: %v", statsFile, err)
+				}
+			}
+		}()
+	}
+
 	mux := http.NewServeMux()
 	// Liveness/readiness probe — not proxied, not honeypot-able.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -91,5 +108,10 @@ func main() {
 	}
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+	if statsFile != "" {
+		if err := waf.Stats().Save(statsFile); err != nil {
+			log.Printf("stats: final save %s: %v", statsFile, err)
+		}
 	}
 }

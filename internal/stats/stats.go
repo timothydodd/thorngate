@@ -1,10 +1,15 @@
 // Package stats keeps lightweight, in-memory traffic counters for the admin
 // portal. Headline totals are lock-free atomics; a small per-minute ring buffer
-// (guarded by a mutex) backs the traffic-over-time chart. Everything is
-// memory-only and resets on restart — nothing is persisted, by design.
+// (guarded by a mutex) backs the traffic-over-time chart. Nothing touches disk
+// on the request path — but the whole state (counters, series, recent feed) can
+// optionally be dumped to a file periodically (Save) and pulled back in at
+// startup (Load) so a restart doesn't wipe the dashboard.
 package stats
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -271,4 +276,135 @@ func (c *Collector) Snapshot() Snapshot {
 		Since:     c.since,
 		Series:    series,
 	}
+}
+
+// persisted is the on-disk representation of a Collector. Buckets carry their
+// unix minute so stale ones can be discarded on load; Recent is oldest-first.
+type persisted struct {
+	Requests  uint64    `json:"requests"`
+	Blocked   uint64    `json:"blocked"`
+	Honeypots uint64    `json:"honeypots"`
+	TempBans  uint64    `json:"temp_bans"`
+	Status2xx uint64    `json:"status_2xx"`
+	Status3xx uint64    `json:"status_3xx"`
+	Status4xx uint64    `json:"status_4xx"`
+	Status5xx uint64    `json:"status_5xx"`
+	BytesSent uint64    `json:"bytes_sent"`
+	Since     time.Time `json:"since"`
+	Buckets   []Bucket  `json:"buckets"`
+	Recent    []Event   `json:"recent"`
+}
+
+// Save atomically writes the collector's full state to file (temp file + fsync
+// + rename, the same pattern the blacklist uses). Safe to call concurrently
+// with request traffic.
+func (c *Collector) Save(file string) error {
+	if file == "" {
+		return nil
+	}
+	p := persisted{
+		Requests:  c.requests.Load(),
+		Blocked:   c.blocked.Load(),
+		Honeypots: c.honeypots.Load(),
+		TempBans:  c.tempBans.Load(),
+		Status2xx: c.s2xx.Load(),
+		Status3xx: c.s3xx.Load(),
+		Status4xx: c.s4xx.Load(),
+		Status5xx: c.s5xx.Load(),
+		BytesSent: c.bytesSent.Load(),
+		Since:     c.since,
+	}
+
+	c.mu.Lock()
+	for _, b := range c.buckets {
+		if b.min != 0 {
+			p.Buckets = append(p.Buckets, Bucket{Minute: b.min, Requests: b.reqs, Blocked: b.blk})
+		}
+	}
+	c.mu.Unlock()
+
+	newestFirst := c.recentSnapshot()
+	p.Recent = make([]Event, 0, len(newestFirst))
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		p.Recent = append(p.Recent, newestFirst[i])
+	}
+
+	data, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	tmp := file + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, file)
+}
+
+// Load restores state previously written by Save. A missing file is not an
+// error (fresh install). Series buckets that have aged out of the window and
+// recent events beyond the feed's capacity are dropped. Call it before the
+// proxy starts serving traffic.
+func (c *Collector) Load(file string) error {
+	if file == "" {
+		return nil
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var p persisted
+	if err := json.Unmarshal(data, &p); err != nil {
+		return fmt.Errorf("parse: %w", err)
+	}
+
+	c.requests.Store(p.Requests)
+	c.blocked.Store(p.Blocked)
+	c.honeypots.Store(p.Honeypots)
+	c.tempBans.Store(p.TempBans)
+	c.s2xx.Store(p.Status2xx)
+	c.s3xx.Store(p.Status3xx)
+	c.s4xx.Store(p.Status4xx)
+	c.s5xx.Store(p.Status5xx)
+	c.bytesSent.Store(p.BytesSent)
+	if !p.Since.IsZero() {
+		c.since = p.Since
+	}
+
+	cur := time.Now().UTC().Unix() / 60
+	n := int64(len(c.buckets))
+	c.mu.Lock()
+	for _, b := range p.Buckets {
+		if b.Minute > cur || b.Minute <= cur-n {
+			continue // outside the live window
+		}
+		c.buckets[int(b.Minute%n)] = bucket{min: b.Minute, reqs: b.Requests, blk: b.Blocked}
+	}
+	c.mu.Unlock()
+
+	// Refill the recent feed oldest-first so the ring's write position ends up
+	// exactly where it would be had the events been observed live. If the saved
+	// feed exceeds the (possibly reconfigured) capacity, keep the newest.
+	recent := p.Recent
+	if capacity := len(c.recent); capacity > 0 && len(recent) > capacity {
+		recent = recent[len(recent)-capacity:]
+	}
+	for _, e := range recent {
+		c.Observe(e)
+	}
+	return nil
 }

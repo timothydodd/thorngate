@@ -9,6 +9,7 @@ import (
 	"embed"
 	"encoding/json"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"path"
@@ -129,7 +130,8 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	case auth.ErrWeakPassword:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new password is too short"})
 	default:
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not change password"})
+		log.Printf("admin: password change failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save new password (is the credentials file writable?)"})
 	}
 }
 

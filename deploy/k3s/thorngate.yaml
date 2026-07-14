@@ -36,6 +36,10 @@ data:
         "listen": ":9000",
         "credentials_file": "/data/admin_credentials.json"
       },
+      "stats": {
+        "file": "/data/stats.json",
+        "save_interval": "1m"
+      },
       "upstream": "10.0.0.10:8080",
       "routes": [
         { "host": "api.example.com", "upstream": "10.0.0.5:3000" },
@@ -59,8 +63,9 @@ type: Opaque
 stringData:
   token: change-me-please
 ---
-# Persists the blacklist across restarts. k3s ships local-path as the default
-# StorageClass, so this just works. RWO is fine because we run a single replica.
+# Persists the blacklist, admin credentials, and traffic stats across restarts.
+# k3s ships local-path as the default StorageClass, so this just works. RWO is
+# fine because we run a single replica.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

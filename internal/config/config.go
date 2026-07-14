@@ -65,7 +65,7 @@ type Config struct {
 	// Stats is OPTIONAL and ON by default. It keeps in-memory traffic counters
 	// (totals + a rolling per-minute series) for the admin portal. The overhead
 	// is a few atomic increments per request; set "disabled": true to turn it
-	// off. Counters are memory-only and reset on restart.
+	// off. Counters reset on restart unless "file" points at a persistent path.
 	Stats *Stats `json:"stats"`
 }
 
@@ -81,6 +81,16 @@ type Stats struct {
 	// can hold (IP + path + outcome). The portal shows up to the last 24 hours
 	// of it, paginated. Default 5000 (~1 MB); set negative to omit the feed.
 	RecentRequests int `json:"recent_requests"`
+	// File, when set, makes the counters and recent-requests feed survive
+	// restarts: they are saved there periodically (and on shutdown) and loaded
+	// back at startup. Point it at a persistent volume (e.g. "/data/stats.json").
+	// Empty (the default) keeps stats memory-only.
+	File string `json:"file"`
+	// SaveInterval is how often the stats file is rewritten (Go duration).
+	// Default "1m". Ignored when File is empty.
+	SaveInterval string `json:"save_interval"`
+
+	saveInterval time.Duration
 }
 
 func (s *Stats) compile() error {
@@ -90,8 +100,22 @@ func (s *Stats) compile() error {
 	if s.RecentRequests == 0 {
 		s.RecentRequests = 5000
 	}
+	if s.SaveInterval == "" {
+		s.SaveInterval = "1m"
+	}
+	d, err := time.ParseDuration(s.SaveInterval)
+	if err != nil {
+		return fmt.Errorf("save_interval %q: %w", s.SaveInterval, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("save_interval %q: must be positive", s.SaveInterval)
+	}
+	s.saveInterval = d
 	return nil
 }
+
+// SaveIntervalDur returns the parsed persistence interval.
+func (s *Stats) SaveIntervalDur() time.Duration { return s.saveInterval }
 
 // Enabled reports whether traffic counters should be kept.
 func (s *Stats) Enabled() bool { return !s.Disabled }

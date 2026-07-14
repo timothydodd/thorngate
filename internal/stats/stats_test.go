@@ -1,6 +1,8 @@
 package stats
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -160,5 +162,102 @@ func TestBytesSent(t *testing.T) {
 	c.Bytes(-3) // ignored
 	if got := c.Snapshot().BytesSent; got != 2000 {
 		t.Errorf("bytes_sent = %d, want 2000", got)
+	}
+}
+
+func TestSaveLoadRoundTrip(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "stats.json")
+	now := time.Now().UTC()
+
+	c1 := New(60, 100)
+	c1.Request(false)
+	c1.Request(true)
+	c1.Honeypot()
+	c1.Status(200)
+	c1.Status(404)
+	c1.Bytes(1234)
+	c1.Observe(Event{Time: now, IP: "1.1.1.1", Path: "/a", Status: 200, Outcome: "proxied"})
+	c1.Observe(Event{Time: now, IP: "2.2.2.2", Path: "/b", Status: 403, Outcome: "blocked"})
+	if err := c1.Save(file); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	c2 := New(60, 100)
+	if err := c2.Load(file); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	s1, s2 := c1.Snapshot(), c2.Snapshot()
+	if s2.Requests != s1.Requests || s2.Blocked != s1.Blocked || s2.Honeypots != s1.Honeypots ||
+		s2.Status2xx != s1.Status2xx || s2.Status4xx != s1.Status4xx || s2.BytesSent != s1.BytesSent {
+		t.Errorf("counters differ after reload: got %+v, want %+v", s2, s1)
+	}
+	if !s2.Since.Equal(s1.Since) {
+		t.Errorf("since = %v, want %v", s2.Since, s1.Since)
+	}
+
+	// The traffic series should survive the reload (summed, in case the minute
+	// rolled over between save and load).
+	var reqs, blk uint64
+	for _, b := range s2.Series {
+		reqs += b.Requests
+		blk += b.Blocked
+	}
+	if reqs != 2 || blk != 1 {
+		t.Errorf("series after reload: requests=%d blocked=%d, want 2/1", reqs, blk)
+	}
+
+	// The recent feed should come back newest-first with counts intact.
+	page := c2.Recent(0, 1, 10)
+	if page.Total != 2 {
+		t.Fatalf("recent total = %d, want 2", page.Total)
+	}
+	if page.Events[0].Path != "/b" || page.Events[1].Path != "/a" {
+		t.Errorf("recent order = %q,%q, want /b,/a", page.Events[0].Path, page.Events[1].Path)
+	}
+
+	// New events after a reload keep the ring consistent.
+	c2.Observe(Event{Time: now, IP: "3.3.3.3", Path: "/c", Status: 200, Outcome: "proxied"})
+	if got := c2.Recent(0, 1, 10).Events[0].Path; got != "/c" {
+		t.Errorf("newest after reload = %q, want /c", got)
+	}
+}
+
+func TestLoadShrunkRecentCapacityKeepsNewest(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "stats.json")
+	now := time.Now().UTC()
+
+	c1 := New(60, 10)
+	for _, p := range []string{"/a", "/b", "/c", "/d"} {
+		c1.Observe(Event{Time: now, IP: "1.1.1.1", Path: p})
+	}
+	if err := c1.Save(file); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	c2 := New(60, 2) // feed shrunk between runs
+	if err := c2.Load(file); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	page := c2.Recent(0, 1, 10)
+	if page.Total != 2 || page.Events[0].Path != "/d" || page.Events[1].Path != "/c" {
+		t.Errorf("shrunk feed = %+v, want newest two /d,/c", page.Events)
+	}
+}
+
+func TestLoadMissingFileIsNoop(t *testing.T) {
+	c := New(60, 10)
+	if err := c.Load(filepath.Join(t.TempDir(), "nope.json")); err != nil {
+		t.Errorf("missing file should not error: %v", err)
+	}
+}
+
+func TestLoadCorruptFileErrors(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "stats.json")
+	if err := os.WriteFile(file, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(60, 10).Load(file); err == nil {
+		t.Error("corrupt file should error")
 	}
 }

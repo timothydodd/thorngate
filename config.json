@@ -25,12 +25,14 @@
   "admin": {
     "enabled": true,
     "listen": ":9000",
-    "credentials_file": "admin_credentials.json"
+    "credentials_file": "/data/admin_credentials.json"
   },
   "stats": {
     "disabled": false,
     "window_minutes": 60,
-    "recent_requests": 5000
+    "recent_requests": 5000,
+    "file": "/data/stats.json",
+    "save_interval": "1m"
   },
   "upstream": "10.0.0.10:8080",
   "routes": [

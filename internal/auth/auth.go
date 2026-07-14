@@ -18,8 +18,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash"
-	"log"
 	"os"
 	"sync"
 	"time"
@@ -99,7 +99,11 @@ func New(file string) (*Store, error) {
 		return nil, err
 	}
 	if file != "" {
-		s.persist()
+		// Fail fast: if the seed can't be written here, a later password change
+		// can't be either, and it would silently vanish on restart.
+		if err := s.persist(); err != nil {
+			return nil, fmt.Errorf("credentials file %s is not writable: %w", file, err)
+		}
 	}
 	return s, nil
 }
@@ -176,6 +180,8 @@ func (s *Store) Logout(token string) {
 
 // ChangePassword verifies the current password, then replaces it. All existing
 // sessions except the caller's stay valid; callers may keep using their token.
+// If the new credentials cannot be persisted, the change is rolled back and an
+// error returned — otherwise the "new" password would silently die on restart.
 func (s *Store) ChangePassword(current, next string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,10 +193,14 @@ func (s *Store) ChangePassword(current, next string) error {
 	if len(next) < MinPasswordLen {
 		return ErrWeakPassword
 	}
+	oldSalt, oldHash, oldIter := s.salt, s.hash, s.iter
 	if err := s.setPassword(s.username, next); err != nil {
 		return err
 	}
-	s.persist()
+	if err := s.persist(); err != nil {
+		s.salt, s.hash, s.iter = oldSalt, oldHash, oldIter
+		return err
+	}
 	return nil
 }
 
@@ -206,9 +216,9 @@ func (s *Store) sweepLocked() {
 
 // persist atomically writes the credentials file. Caller holds s.mu. Follows the
 // blacklist's temp-file + fsync + rename pattern.
-func (s *Store) persist() {
+func (s *Store) persist() error {
 	if s.file == "" {
-		return
+		return nil
 	}
 	c := creds{
 		Username:   s.username,
@@ -218,32 +228,25 @@ func (s *Store) persist() {
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
-		log.Printf("auth: marshal failed: %v", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	tmp := s.file + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		log.Printf("auth: open %s failed: %v", tmp, err)
-		return
+		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		log.Printf("auth: write %s failed: %v", tmp, err)
 		_ = f.Close()
-		return
+		return err
 	}
 	if err := f.Sync(); err != nil {
-		log.Printf("auth: fsync %s failed: %v", tmp, err)
 		_ = f.Close()
-		return
+		return err
 	}
 	if err := f.Close(); err != nil {
-		log.Printf("auth: close %s failed: %v", tmp, err)
-		return
+		return err
 	}
-	if err := os.Rename(tmp, s.file); err != nil {
-		log.Printf("auth: rename %s -> %s failed: %v", tmp, s.file, err)
-	}
+	return os.Rename(tmp, s.file)
 }
 
 // newToken returns a 256-bit random session token, hex-encoded.
