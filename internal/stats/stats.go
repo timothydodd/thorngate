@@ -21,6 +21,7 @@ type Collector struct {
 	s3xx      atomic.Uint64
 	s4xx      atomic.Uint64
 	s5xx      atomic.Uint64
+	bytesSent atomic.Uint64 // response bytes written to clients by proxied requests
 
 	since time.Time
 
@@ -44,6 +45,7 @@ type Event struct {
 	Status   int       `json:"status"`
 	Outcome  string    `json:"outcome"`            // "proxied", "blocked", or "honeypot"
 	Upstream string    `json:"upstream,omitempty"` // resolved upstream URL; empty when never proxied
+	Bytes    int64     `json:"bytes"`              // response bytes sent to the client; 0 when never proxied
 }
 
 // bucket holds one minute of the time series. min is the unix-minute the slot
@@ -64,9 +66,18 @@ type Snapshot struct {
 	Status3xx uint64    `json:"status_3xx"`
 	Status4xx uint64    `json:"status_4xx"`
 	Status5xx uint64    `json:"status_5xx"`
+	BytesSent uint64    `json:"bytes_sent"` // total response bytes sent by proxied requests
 	Since     time.Time `json:"since"`
 	Series    []Bucket  `json:"series"`
-	Recent    []Event   `json:"recent"` // most recent requests, newest first
+}
+
+// RecentPage is one page of the recent-requests feed, newest first.
+type RecentPage struct {
+	Total    int            `json:"total"`     // events in the window across all pages
+	Page     int            `json:"page"`      // 1-based page number, clamped to range
+	PageSize int            `json:"page_size"` // events per page
+	Events   []Event        `json:"events"`
+	IPCounts map[string]int `json:"ip_counts"` // window-wide request count per IP appearing in Events
 }
 
 // Bucket is one minute of the traffic-over-time series.
@@ -120,6 +131,58 @@ func (c *Collector) recentSnapshot() []Event {
 	return out
 }
 
+// Recent returns one page of the recent-requests feed, restricted to events no
+// older than maxAge (<= 0 means no age limit). page is 1-based and clamped into
+// range; pageSize <= 0 defaults to 50. IPCounts holds the window-wide request
+// count for each IP that appears on the returned page, so the UI can flag
+// chatty clients without shipping the whole window.
+func (c *Collector) Recent(maxAge time.Duration, page, pageSize int) RecentPage {
+	all := c.recentSnapshot()
+	if maxAge > 0 {
+		cutoff := time.Now().UTC().Add(-maxAge)
+		// The feed is newest-first, so everything after the first stale event
+		// is stale too.
+		for i, e := range all {
+			if e.Time.Before(cutoff) {
+				all = all[:i]
+				break
+			}
+		}
+	}
+
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+	pages := (len(all) + pageSize - 1) / pageSize
+	if page < 1 {
+		page = 1
+	}
+	if pages > 0 && page > pages {
+		page = pages
+	}
+	start := (page - 1) * pageSize
+	end := min(start+pageSize, len(all))
+	events := all[start:end]
+
+	counts := make(map[string]int, len(events))
+	for _, e := range events {
+		counts[e.IP] = 0
+	}
+	for _, e := range all {
+		if _, ok := counts[e.IP]; ok {
+			counts[e.IP]++
+		}
+	}
+
+	return RecentPage{
+		Total:    len(all),
+		Page:     page,
+		PageSize: pageSize,
+		Events:   events,
+		IPCounts: counts,
+	}
+}
+
 // Request records that a request was received. blocked reports whether it was
 // rejected outright by an existing blacklist entry. It feeds both the headline
 // totals and the per-minute series.
@@ -136,6 +199,13 @@ func (c *Collector) Honeypot() { c.honeypots.Add(1) }
 
 // TempBan records a temp-ban applied for too many bad responses.
 func (c *Collector) TempBan() { c.tempBans.Add(1) }
+
+// Bytes records response bytes sent to a client by a proxied request.
+func (c *Collector) Bytes(n int64) {
+	if n > 0 {
+		c.bytesSent.Add(uint64(n))
+	}
+}
 
 // Status records the final status code of a proxied response, bucketed by class.
 func (c *Collector) Status(code int) {
@@ -197,8 +267,8 @@ func (c *Collector) Snapshot() Snapshot {
 		Status3xx: c.s3xx.Load(),
 		Status4xx: c.s4xx.Load(),
 		Status5xx: c.s5xx.Load(),
+		BytesSent: c.bytesSent.Load(),
 		Since:     c.since,
 		Series:    series,
-		Recent:    c.recentSnapshot(),
 	}
 }

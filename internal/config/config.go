@@ -77,8 +77,9 @@ type Stats struct {
 	// WindowMinutes is how many minutes the traffic-over-time series covers.
 	// Default 60.
 	WindowMinutes int `json:"window_minutes"`
-	// RecentRequests is how many recent requests to keep in the dashboard's
-	// live feed (IP + path + outcome). Default 100; set negative to omit it.
+	// RecentRequests caps how many recent requests the dashboard's request feed
+	// can hold (IP + path + outcome). The portal shows up to the last 24 hours
+	// of it, paginated. Default 5000 (~1 MB); set negative to omit the feed.
 	RecentRequests int `json:"recent_requests"`
 }
 
@@ -87,7 +88,7 @@ func (s *Stats) compile() error {
 		s.WindowMinutes = 60
 	}
 	if s.RecentRequests == 0 {
-		s.RecentRequests = 100
+		s.RecentRequests = 5000
 	}
 	return nil
 }

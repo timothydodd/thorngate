@@ -114,7 +114,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if w.bl.IsBlocked(ip) {
 		if w.stats != nil {
 			w.stats.Request(true)
-			w.observe(ip, r, http.StatusForbidden, "blocked", "")
+			w.observe(ip, r, http.StatusForbidden, "blocked", "", 0)
 		}
 		forbidden(rw)
 		return
@@ -134,7 +134,7 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if w.stats != nil && !quiet {
-			w.observe(ip, r, http.StatusForbidden, "honeypot", "")
+			w.observe(ip, r, http.StatusForbidden, "honeypot", "", 0)
 		}
 		forbidden(rw)
 		return
@@ -155,7 +155,8 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w.recordRequest(ip, r, sw.status, target)
 	if w.stats != nil {
 		w.stats.Status(sw.status)
-		w.observe(ip, r, sw.status, "proxied", target)
+		w.stats.Bytes(sw.bytes)
+		w.observe(ip, r, sw.status, "proxied", target, sw.bytes)
 	}
 	if w.mon != nil {
 		w.monitorResponse(ip, sw.status)
@@ -163,9 +164,9 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 // observe records a request in the stats recent-requests feed. Caller has
-// already checked w.stats != nil. upstream is empty when the request never
-// reached one (blocked / honeypot).
-func (w *WAF) observe(ip string, r *http.Request, status int, outcome, upstream string) {
+// already checked w.stats != nil. upstream is empty (and bytes zero) when the
+// request never reached one (blocked / honeypot).
+func (w *WAF) observe(ip string, r *http.Request, status int, outcome, upstream string, bytes int64) {
 	w.stats.Observe(stats.Event{
 		Time:     time.Now().UTC(),
 		IP:       ip,
@@ -176,6 +177,7 @@ func (w *WAF) observe(ip string, r *http.Request, status int, outcome, upstream 
 		Status:   status,
 		Outcome:  outcome,
 		Upstream: upstream,
+		Bytes:    bytes,
 	})
 }
 
@@ -274,11 +276,13 @@ func forbidden(rw http.ResponseWriter) {
 	_, _ = rw.Write([]byte("403 Forbidden\n"))
 }
 
-// statusWriter wraps http.ResponseWriter to capture the response status code for
-// temp-ban monitoring. It forwards Flush so streaming responses still work.
+// statusWriter wraps http.ResponseWriter to capture the response status code
+// for temp-ban monitoring and the body size for traffic stats. It forwards
+// Flush so streaming responses still work.
 type statusWriter struct {
 	http.ResponseWriter
 	status      int
+	bytes       int64 // body bytes written; hijacked-connection traffic is not counted
 	wroteHeader bool
 }
 
@@ -292,7 +296,9 @@ func (s *statusWriter) WriteHeader(code int) {
 
 func (s *statusWriter) Write(b []byte) (int, error) {
 	s.wroteHeader = true // implicit 200 if WriteHeader was never called
-	return s.ResponseWriter.Write(b)
+	n, err := s.ResponseWriter.Write(b)
+	s.bytes += int64(n)
+	return n, err
 }
 
 func (s *statusWriter) Flush() {

@@ -71,6 +71,11 @@ export const api = {
     request<{ ok: boolean }>('POST', '/admin/password', { current_password, new_password }),
 
   stats: () => request<import('./types').StatsResponse>('GET', '/admin/stats'),
+  recent: (page: number, pageSize: number) =>
+    request<import('./types').RecentResponse>(
+      'GET',
+      `/admin/stats/recent?page=${page}&page_size=${pageSize}`,
+    ),
   blacklist: () => request<import('./types').BlacklistEntry[]>('GET', '/admin/blacklist'),
   ban: (ip: string, reason: string) =>
     request<{ ip: string; added: boolean }>('POST', '/admin/blacklist', { ip, reason }),

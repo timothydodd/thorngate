@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
@@ -49,6 +51,7 @@ func Handler(bl *blacklist.Blacklist, st *stats.Collector, au *auth.Store, apiTo
 
 	// --- Data ---
 	mux.HandleFunc("GET /admin/stats", s.authed(s.handleStats))
+	mux.HandleFunc("GET /admin/stats/recent", s.authed(s.handleRecent))
 	mux.HandleFunc("GET /admin/blacklist", s.authed(s.handleListBlacklist))
 	mux.HandleFunc("POST /admin/blacklist", s.authed(s.handleAddBlacklist))
 	// {key...} is a trailing wildcard so CIDR ranges (which contain "/") can be
@@ -136,6 +139,29 @@ func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "stats": s.st.Snapshot()})
+}
+
+// recentWindow is how far back the paginated recent-requests feed reaches.
+const recentWindow = 24 * time.Hour
+
+// maxRecentPageSize caps page_size so a single request can't dump the whole feed.
+const maxRecentPageSize = 200
+
+func (s *server) handleRecent(w http.ResponseWriter, r *http.Request) {
+	if s.st == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	size, _ := strconv.Atoi(q.Get("page_size"))
+	if size > maxRecentPageSize {
+		size = maxRecentPageSize
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Enabled bool `json:"enabled"`
+		stats.RecentPage
+	}{true, s.st.Recent(recentWindow, page, size)})
 }
 
 func (s *server) handleListBlacklist(w http.ResponseWriter, r *http.Request) {

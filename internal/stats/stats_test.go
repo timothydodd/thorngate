@@ -84,15 +84,15 @@ func TestRecentFeedNewestFirstAndBounded(t *testing.T) {
 		c.Observe(Event{Time: time.Now().UTC(), IP: "1.1.1.1", Path: p, Status: 200, Outcome: "proxied"})
 	}
 
-	recent := c.Snapshot().Recent
-	if len(recent) != 3 {
-		t.Fatalf("recent length = %d, want 3 (bounded to capacity)", len(recent))
+	page := c.Recent(0, 1, 10)
+	if page.Total != 3 {
+		t.Fatalf("total = %d, want 3 (bounded to capacity)", page.Total)
 	}
 	// Newest first, oldest two ("/a", "/b") evicted.
 	want := []string{"/e", "/d", "/c"}
 	for i, w := range want {
-		if recent[i].Path != w {
-			t.Errorf("recent[%d].Path = %q, want %q", i, recent[i].Path, w)
+		if page.Events[i].Path != w {
+			t.Errorf("events[%d].Path = %q, want %q", i, page.Events[i].Path, w)
 		}
 	}
 }
@@ -100,7 +100,65 @@ func TestRecentFeedNewestFirstAndBounded(t *testing.T) {
 func TestRecentFeedDisabled(t *testing.T) {
 	c := New(60, -1) // negative clamps to 0 → feed off
 	c.Observe(Event{IP: "1.1.1.1", Path: "/x"})
-	if got := len(c.Snapshot().Recent); got != 0 {
-		t.Errorf("recent length = %d, want 0 when feed disabled", got)
+	if got := c.Recent(0, 1, 10).Total; got != 0 {
+		t.Errorf("total = %d, want 0 when feed disabled", got)
+	}
+}
+
+func TestRecentPaginationAndIPCounts(t *testing.T) {
+	c := New(60, 100)
+	now := time.Now().UTC()
+	// 7 requests from a chatty IP, 2 from a quiet one, interleaved.
+	for i := 0; i < 7; i++ {
+		c.Observe(Event{Time: now, IP: "9.9.9.9", Path: "/scan", Status: 404, Outcome: "proxied"})
+	}
+	c.Observe(Event{Time: now, IP: "1.1.1.1", Path: "/ok", Status: 200, Outcome: "proxied"})
+	c.Observe(Event{Time: now, IP: "1.1.1.1", Path: "/ok2", Status: 200, Outcome: "proxied"})
+
+	page := c.Recent(24*time.Hour, 1, 4)
+	if page.Total != 9 {
+		t.Fatalf("total = %d, want 9", page.Total)
+	}
+	if len(page.Events) != 4 {
+		t.Fatalf("page 1 length = %d, want 4", len(page.Events))
+	}
+	// Counts are window-wide even though the page only shows a slice.
+	if got := page.IPCounts["1.1.1.1"]; got != 2 {
+		t.Errorf("ip_counts[1.1.1.1] = %d, want 2", got)
+	}
+
+	page3 := c.Recent(24*time.Hour, 3, 4)
+	if page3.Page != 3 || len(page3.Events) != 1 {
+		t.Errorf("page 3: page=%d len=%d, want page=3 len=1", page3.Page, len(page3.Events))
+	}
+	if got := page3.IPCounts["9.9.9.9"]; got != 7 {
+		t.Errorf("ip_counts[9.9.9.9] = %d, want 7", got)
+	}
+
+	// Out-of-range page clamps to the last page.
+	if got := c.Recent(24*time.Hour, 99, 4).Page; got != 3 {
+		t.Errorf("page clamp = %d, want 3", got)
+	}
+}
+
+func TestRecentAgeWindow(t *testing.T) {
+	c := New(60, 100)
+	now := time.Now().UTC()
+	c.Observe(Event{Time: now.Add(-25 * time.Hour), IP: "1.1.1.1", Path: "/old"})
+	c.Observe(Event{Time: now, IP: "1.1.1.1", Path: "/new"})
+
+	page := c.Recent(24*time.Hour, 1, 10)
+	if page.Total != 1 || page.Events[0].Path != "/new" {
+		t.Errorf("got total=%d, want only /new inside the 24h window", page.Total)
+	}
+}
+
+func TestBytesSent(t *testing.T) {
+	c := New(60, 100)
+	c.Bytes(1500)
+	c.Bytes(500)
+	c.Bytes(-3) // ignored
+	if got := c.Snapshot().BytesSent; got != 2000 {
+		t.Errorf("bytes_sent = %d, want 2000", got)
 	}
 }

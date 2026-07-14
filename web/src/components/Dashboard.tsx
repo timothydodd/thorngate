@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
-import { RequestEvent, Snapshot } from '../types'
+import { Snapshot } from '../types'
 import TrafficChart from './TrafficChart'
-import DetailsModal from './DetailsModal'
-import { OutcomeBadge, statusColor } from './badges'
+import RecentRequests from './RecentRequests'
+import { formatBytes } from './badges'
 
-function StatCard({ label, value, accent }: { label: string; value: number; accent?: string }) {
+function StatCard({ label, value, accent }: { label: string; value: string | number; accent?: string }) {
   return (
     <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">
-      <div className={'text-2xl font-semibold ' + (accent ?? '')}>{value.toLocaleString()}</div>
+      <div className={'text-2xl font-semibold ' + (accent ?? '')}>
+        {typeof value === 'number' ? value.toLocaleString() : value}
+      </div>
       <div className="text-xs text-slate-500 mt-1">{label}</div>
     </div>
   )
@@ -18,7 +20,6 @@ export default function Dashboard() {
   const [snap, setSnap] = useState<Snapshot | null>(null)
   const [enabled, setEnabled] = useState(true)
   const [error, setError] = useState('')
-  const [selected, setSelected] = useState<RequestEvent | null>(null)
 
   const load = useCallback(async () => {
     try {
@@ -64,6 +65,7 @@ export default function Dashboard() {
         <StatCard label="3xx" value={snap.status_3xx} accent="text-sky-500" />
         <StatCard label="4xx" value={snap.status_4xx} accent="text-amber-500" />
         <StatCard label="5xx" value={snap.status_5xx} accent="text-rose-500" />
+        <StatCard label="Data sent" value={formatBytes(snap.bytes_sent)} accent="text-sky-500" />
       </div>
 
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">
@@ -82,75 +84,7 @@ export default function Dashboard() {
         <p className="text-xs text-slate-400 mt-3">counting since {new Date(snap.since).toLocaleString()}</p>
       </div>
 
-      <div className="rounded-xl border border-slate-200 dark:border-slate-800 overflow-hidden">
-        <div className="px-4 py-2.5 bg-slate-100 dark:bg-slate-800/60 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-slate-600 dark:text-slate-300">Recent requests</h2>
-          <span className="text-xs text-slate-400">
-            {snap.recent?.length ? `${snap.recent.length} shown (newest first)` : ''}
-          </span>
-        </div>
-        <div className="max-h-[28rem] overflow-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-slate-50 dark:bg-slate-900/60 text-slate-500 text-xs uppercase tracking-wide sticky top-0">
-              <tr>
-                {['Time', 'IP', 'Method', 'Host', 'Path', 'Upstream', 'Status', 'Outcome', ''].map((h, i) => (
-                  <th key={i} className="text-left font-medium px-3 py-2 whitespace-nowrap">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-              {!snap.recent?.length ? (
-                <tr>
-                  <td colSpan={9} className="px-4 py-3 text-slate-400">
-                    no requests yet
-                  </td>
-                </tr>
-              ) : (
-                snap.recent.map((e, i) => {
-                  const pathFull = e.path + (e.query ? '?' + e.query : '')
-                  return (
-                    <tr key={i} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
-                      <td className="px-3 py-1.5 text-slate-400 whitespace-nowrap">
-                        {new Date(e.time).toLocaleTimeString()}
-                      </td>
-                      <td className="px-3 py-1.5 font-mono whitespace-nowrap">{e.ip}</td>
-                      <td className="px-3 py-1.5">{e.method}</td>
-                      <td className="px-3 py-1.5 font-mono max-w-[11rem] truncate" title={e.host}>
-                        {e.host}
-                      </td>
-                      <td className="px-3 py-1.5 font-mono max-w-[15rem] truncate" title={pathFull}>
-                        {pathFull}
-                      </td>
-                      <td
-                        className="px-3 py-1.5 font-mono max-w-[11rem] truncate text-slate-500"
-                        title={e.upstream}
-                      >
-                        {e.upstream || '—'}
-                      </td>
-                      <td className={'px-3 py-1.5 font-mono ' + statusColor(e.status)}>{e.status}</td>
-                      <td className="px-3 py-1.5">
-                        <OutcomeBadge outcome={e.outcome} />
-                      </td>
-                      <td className="px-3 py-1.5 text-right">
-                        <button
-                          onClick={() => setSelected(e)}
-                          className="px-2 py-0.5 rounded-md border border-slate-300 dark:border-slate-700 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
-                        >
-                          Details
-                        </button>
-                      </td>
-                    </tr>
-                  )
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {selected && <DetailsModal event={selected} onClose={() => setSelected(null)} />}
+      <RecentRequests />
     </div>
   )
 }

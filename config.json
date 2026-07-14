@@ -30,7 +30,7 @@
   "stats": {
     "disabled": false,
     "window_minutes": 60,
-    "recent_requests": 100
+    "recent_requests": 5000
   },
   "upstream": "10.0.0.10:8080",
   "routes": [

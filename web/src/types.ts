@@ -10,6 +10,7 @@ export interface RequestEvent {
   status: number
   outcome: 'proxied' | 'blocked' | 'honeypot' | string
   upstream?: string
+  bytes: number
 }
 
 export interface Bucket {
@@ -27,14 +28,25 @@ export interface Snapshot {
   status_3xx: number
   status_4xx: number
   status_5xx: number
+  bytes_sent: number
   since: string
   series: Bucket[]
-  recent: RequestEvent[]
 }
 
 export interface StatsResponse {
   enabled: boolean
   stats?: Snapshot
+}
+
+// One page of the last-24h request feed (GET /admin/stats/recent).
+export interface RecentResponse {
+  enabled: boolean
+  total: number
+  page: number
+  page_size: number
+  events: RequestEvent[]
+  // window-wide request count per IP appearing in events
+  ip_counts: Record<string, number>
 }
 
 export interface BlacklistEntry {

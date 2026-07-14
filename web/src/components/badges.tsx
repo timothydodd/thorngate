@@ -17,3 +17,15 @@ export function OutcomeBadge({ outcome }: { outcome: string }) {
   const cls = OUTCOME_STYLES[outcome] ?? OUTCOME_STYLES.proxied
   return <span className={'text-xs px-1.5 py-0.5 rounded ' + cls}>{outcome}</span>
 }
+
+export function formatBytes(n: number | undefined): string {
+  if (!n) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return (i === 0 ? v.toString() : v.toFixed(1)) + ' ' + units[i]
+}

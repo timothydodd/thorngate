@@ -186,7 +186,7 @@ It is **on by default** with sensible bounds — disable or tune it with a `requ
 
 ### Traffic stats (`stats`)
 
-thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, and a 2xx/3xx/4xx/5xx breakdown of proxied responses, plus a per-minute requests-vs-blocked chart and a **live feed of recent requests** (time, IP, method, host, path + query, the upstream it was routed to, status, and outcome — `proxied` / `blocked` / `honeypot`). The host and upstream columns make it easy to spot routing problems — e.g. a hostname that isn't matching its route and falling through to the default upstream.
+thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, a 2xx/3xx/4xx/5xx breakdown of proxied responses, and total **data sent** (response bytes written to clients by proxied requests), plus a per-minute requests-vs-blocked chart and a **paginated feed of the last 24 hours of requests** (time, IP, method, host, path + query, the upstream it was routed to, status, bytes sent, and outcome — `proxied` / `blocked` / `honeypot`). The host and upstream columns make it easy to spot routing problems — e.g. a hostname that isn't matching its route and falling through to the default upstream.
 
 It is **on by default** — the headline totals are lock-free atomics and the time series is a small per-minute ring buffer, so the overhead is a few increments per request. Disable or tune it with a `stats` block:
 
@@ -194,7 +194,7 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 "stats": {
   "disabled": false,
   "window_minutes": 60,
-  "recent_requests": 100
+  "recent_requests": 5000
 }
 ```
 
@@ -202,16 +202,16 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 |-------|---------|---------|
 | `disabled` | turn the feature off entirely (zero overhead; the dashboard reports stats as off) | `false` |
 | `window_minutes` | how many minutes the traffic-over-time chart covers | `60` |
-| `recent_requests` | how many recent requests to keep in the live feed (IP + path + outcome); set negative to omit the feed | `100` |
+| `recent_requests` | cap on how many recent requests the 24-hour request feed can hold (~1 MB at the default); set negative to omit the feed | `5000` |
 
 - Counters live in memory only — they are **not** persisted and reset to zero on restart.
-- Read them programmatically via `GET /admin/stats` (same bearer token as the rest of the admin API).
+- Read them programmatically via `GET /admin/stats` (counters + series) and `GET /admin/stats/recent` (the paginated 24-hour feed) — same bearer token as the rest of the admin API.
 
 ### Admin portal (`admin`)
 
 An optional admin server on a **separate port** hosts the portal: a **React single-page app** (embedded into the binary via `go:embed`, so no CDN and no runtime dependencies) plus the JSON API it talks to. It lets you view traffic and add/remove blocked IPs live — changes hit the in-memory store and are persisted immediately, no restart. Three tabs:
 
-- **Dashboard** — traffic stats (see `stats` above), a per-minute requests-vs-blocked chart, and a live feed of recent requests. Each row has a **Details** button that opens the full request (host, path, query, resolved upstream, status, outcome).
+- **Dashboard** — traffic stats (see `stats` above), a per-minute requests-vs-blocked chart, and a paginated feed of the last 24 hours of requests. An IP with more than 5 requests in the window gets a count badge, and each row has a **Ban** button (permanent blacklist, one click) plus a **Details** button that opens the full request (host, path, query, resolved upstream, status, bytes sent, outcome).
 - **Blacklist** — add/remove bans (single IP or CIDR).
 - **Settings** — change the admin password.
 
@@ -249,6 +249,7 @@ API (session token from `/admin/login`, or the legacy bearer token, sent as `Aut
 | `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP or CIDR range |
 | `DELETE` | `/admin/blacklist/{key}` | — | unban an IP or CIDR range |
 | `GET` | `/admin/stats` | — | traffic counters + per-minute series (JSON; `{"enabled":false}` if stats are off) |
+| `GET` | `/admin/stats/recent?page=1&page_size=50` | — | last 24h of requests, paginated newest-first (`page_size` max 200), with per-IP request counts for the returned page |
 | `GET` | `/` (+ assets) | — | the React portal |
 
 The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range.
