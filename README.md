@@ -194,7 +194,9 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 "stats": {
   "disabled": false,
   "window_minutes": 60,
-  "recent_requests": 5000
+  "recent_requests": 5000,
+  "file": "/data/stats.json",
+  "save_interval": "1m"
 }
 ```
 
@@ -203,8 +205,10 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 | `disabled` | turn the feature off entirely (zero overhead; the dashboard reports stats as off) | `false` |
 | `window_minutes` | how many minutes the traffic-over-time chart covers | `60` |
 | `recent_requests` | cap on how many recent requests the 24-hour request feed can hold (~1 MB at the default); set negative to omit the feed | `5000` |
+| `file` | when set, counters + series + the recent-requests feed are saved here periodically (and on graceful shutdown) and loaded back at startup, so the dashboard survives restarts. Point it at a persistent volume. Empty keeps stats memory-only | *(empty)* |
+| `save_interval` | how often the stats file is rewritten (Go duration); ignored when `file` is empty | `"1m"` |
 
-- Counters live in memory only — they are **not** persisted and reset to zero on restart.
+- Without `file`, counters live in memory only and reset to zero on restart. With it, at most the last `save_interval` of traffic is lost on a crash (a graceful shutdown saves on exit). Saving happens on a background timer, never on the request path.
 - Read them programmatically via `GET /admin/stats` (counters + series) and `GET /admin/stats/recent` (the paginated 24-hour feed) — same bearer token as the rest of the admin API.
 
 ### Admin portal (`admin`)
@@ -228,7 +232,7 @@ An optional admin server on a **separate port** hosts the portal: a **React sing
 }
 ```
 
-- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`; point it at a persistent volume so the change survives restarts). Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart.
+- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`, relative to the working directory — **point it at a persistent volume like `/data/admin_credentials.json`** so the change survives restarts). thorngate refuses to start if this file can't be written, and a password change that can't be saved to disk fails with an error instead of silently living in memory only. Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart.
 - **`token`** is an **optional** legacy bearer token for scripted/API access, accepted alongside interactive login. Leave it empty (or set it via **`THORNGATE_ADMIN_TOKEN`**) to disable it and rely solely on login.
 - **Keep this port cluster-internal — never attach it to the Cloudflare tunnel.** In k3s it's a separate ClusterIP `Service` (`thorngate-admin`); reach it with port-forward.
 
