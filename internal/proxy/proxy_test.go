@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
@@ -75,7 +76,7 @@ func TestProxiesNormalRequest(t *testing.T) {
 
 func TestBlockedIPGetsForbiddenWithoutUpstream(t *testing.T) {
 	var hits int32
-	w, bl := newWAF(t, okBackend(&hits), "")
+	w, bl := newWAF(t, okBackend(&hits), `,"block_action":"forbidden"`)
 	bl.Add("6.6.6.6", "manual", "")
 
 	rec := httptest.NewRecorder()
@@ -91,7 +92,7 @@ func TestBlockedIPGetsForbiddenWithoutUpstream(t *testing.T) {
 
 func TestHoneypotHitBlacklistsClient(t *testing.T) {
 	var hits int32
-	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"]`)
+	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"],"block_action":"forbidden"`)
 
 	// Hitting the honeypot is forbidden and does not reach the upstream.
 	rec := httptest.NewRecorder()
@@ -115,7 +116,7 @@ func TestHoneypotHitBlacklistsClient(t *testing.T) {
 
 func TestClientIPComesFromHeaderNotPeer(t *testing.T) {
 	var hits int32
-	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"]`)
+	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"],"block_action":"forbidden"`)
 
 	r := reqFrom("8.8.8.8", "/wp-admin")
 	r.RemoteAddr = "203.0.113.9:5555" // the TCP peer differs from the CF header
@@ -131,7 +132,7 @@ func TestClientIPComesFromHeaderNotPeer(t *testing.T) {
 
 func TestTempBanAfterRepeatedBadResponses(t *testing.T) {
 	notFound := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) }
-	extra := `,"temp_ban":{"enabled":true,"max":3,"window":"1m","ban_duration":"15m","status_codes":[404]}`
+	extra := `,"block_action":"forbidden","temp_ban":{"enabled":true,"max":3,"window":"1m","ban_duration":"15m","status_codes":[404]}`
 	w, bl := newWAF(t, notFound, extra)
 
 	const ip = "4.4.4.4"
@@ -150,5 +151,88 @@ func TestTempBanAfterRepeatedBadResponses(t *testing.T) {
 	w.ServeHTTP(rec, reqFrom(ip, "/missing"))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status after ban = %d, want 403", rec.Code)
+	}
+}
+
+// denyClient makes a real HTTP request (recorders can't be hijacked) and
+// reports whether the server ended the connection without any response.
+func denyClient(t *testing.T, srvURL, ip, path string) error {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, srvURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Cf-Connecting-Ip", ip)
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		t.Fatalf("got a %d response, want the connection dropped with no response", resp.StatusCode)
+	}
+	return err
+}
+
+func TestBlockActionDrop(t *testing.T) {
+	var hits int32
+	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"],"block_action":"drop"`)
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	// Honeypot hit: connection dropped, IP blacklisted, upstream untouched.
+	denyClient(t, srv.URL, "5.5.5.5", "/wp-admin")
+	if !bl.IsBlocked("5.5.5.5") {
+		t.Fatal("client should be blacklisted after a honeypot hit")
+	}
+	// Every later request from that IP is dropped too.
+	denyClient(t, srv.URL, "5.5.5.5", "/")
+	if hits != 0 {
+		t.Fatalf("dropped traffic must not reach upstream (hits = %d)", hits)
+	}
+}
+
+func TestBlockActionTarpitHoldsThenDrops(t *testing.T) {
+	var hits int32
+	extra := `,"honeypots":["/wp-admin"],"block_action":"tarpit","tarpit_duration":"150ms"`
+	w, _ := newWAF(t, okBackend(&hits), extra)
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	start := time.Now()
+	denyClient(t, srv.URL, "3.3.3.3", "/wp-admin")
+	if held := time.Since(start); held < 150*time.Millisecond {
+		t.Fatalf("connection ended after %v, want it held for at least the 150ms tarpit cap", held)
+	}
+	if hits != 0 {
+		t.Fatalf("tarpitted traffic must not reach upstream (hits = %d)", hits)
+	}
+}
+
+func TestTarpitMaxFallsBackToDrop(t *testing.T) {
+	var hits int32
+	extra := `,"honeypots":["/wp-admin"],"block_action":"tarpit","tarpit_duration":"5s","tarpit_max":1`
+	w, _ := newWAF(t, okBackend(&hits), extra)
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	// Fill the single tarpit slot, then wait until it is actually held.
+	go func() {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/wp-admin", nil)
+		req.Header.Set("Cf-Connecting-Ip", "2.2.2.2")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	for i := 0; w.tarpitting.Load() == 0; i++ {
+		if i > 100 {
+			t.Fatal("first request never entered the tarpit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Over the cap: the next blocked request must be dropped immediately,
+	// not held for the 5s tarpit duration.
+	start := time.Now()
+	denyClient(t, srv.URL, "2.2.2.3", "/wp-admin")
+	if held := time.Since(start); held > 2*time.Second {
+		t.Fatalf("over-cap request held for %v, want an immediate drop", held)
 	}
 }

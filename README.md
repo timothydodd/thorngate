@@ -7,7 +7,7 @@
 A tiny, zero-dependency Go reverse-proxy WAF that sits behind a **Cloudflare Tunnel** and in front of your web/API services — a gate at the mouth of the tunnel that snags intruders. It:
 
 - Reverse-proxies configured **path prefixes → internal upstreams** (k8s services or raw IPs), including **WebSocket / SignalR** (protocol-upgrade) connections.
-- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and gets `403` on every future request.
+- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and ghosted on every future request — by default the connection is tarpitted (held open, never answered) and then dropped; `block_action` can switch this to an instant drop or a plain `403`.
 - Resolves the real external IP from Cloudflare's `Cf-Connecting-Ip` header.
 - Persists the blacklist to disk so it survives restarts.
 
@@ -20,8 +20,8 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 ```
 
 1. Read client IP from `Cf-Connecting-Ip`.
-2. If IP is blacklisted → `403`.
-3. If the path matches a honeypot → blacklist the IP, persist, `403`.
+2. If IP is blacklisted → tarpit (default; or drop/403, per `block_action`).
+3. If the path matches a honeypot → blacklist the IP, persist, tarpit.
 4. Otherwise proxy to the upstream with the longest matching path prefix.
 
 `/healthz` is reserved for k8s probes (never proxied, never a honeypot).
@@ -56,6 +56,9 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `blacklist_file` | where to persist blocked IPs (mount a volume in k8s) |
 | `whitelist` | IPs never blacklisted (your own IP, internal ranges) — see below |
 | `honeypots` | patterns that trigger an instant blacklist (see below) |
+| `block_action` | what blocked clients get: `tarpit` (default, never respond), `drop`, or `forbidden` (plain 403) — see below |
+| `tarpit_duration` | max time a `tarpit` connection is held, default `100s` |
+| `tarpit_max` | max connections held by the tarpit at once (overflow is dropped instead), default `512` |
 | `upstream` | **default** internal target for all traffic (IP / host:port / URL) |
 | `routes` | optional `host` → `upstream` overrides (see Routing below) |
 | `temp_ban` | optional auto-ban for too many bad responses (see below) |
@@ -104,6 +107,28 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 | `suffix` | path ends with pattern |
 | `glob` | `path.Match` against the full path (`*` does **not** cross `/` — use `contains`/`suffix` for "anywhere") |
 | `regex` | Go `regexp` against the full path |
+
+### Block action (`block_action`)
+
+A blocked client (blacklisted IP or honeypot hit) is **tarpitted by default**: thorngate never responds at all, holding the connection open until the client gives up or `tarpit_duration` elapses, then dropping it. Set `block_action` to change what blocked clients get:
+
+```json
+"block_action": "tarpit",       // "tarpit" (default) | "drop" | "forbidden"
+"tarpit_duration": "100s",      // tarpit only: max hold per connection
+"tarpit_max": 512               // tarpit only: max connections held at once
+```
+
+| action | behavior |
+|--------|----------|
+| `tarpit` (default) | never respond: hold the connection open until the client gives up or `tarpit_duration` elapses, then drop it |
+| `drop` | close the connection immediately without writing any response |
+| `forbidden` | respond with a plain `403 Forbidden` |
+
+`tarpit` is the nastiest for scanners — their worker sits waiting on a socket that will never answer, while on thorngate's side the held request is just one parked goroutine doing no work. Two caps bound the cost: `tarpit_duration` (default `100s`, roughly Cloudflare's own origin timeout) limits how long each connection is held, and `tarpit_max` (default `512`) limits how many are held at once — past it, blocked requests are dropped immediately instead, so a flood can never exhaust file descriptors.
+
+Requests denied without a response show up in the admin dashboard's request feed with **`tarpit`** or **`dropped`** in the Status column instead of a status code (a tarpit that overflowed `tarpit_max` records as `dropped`, since that's what actually happened).
+
+**Behind Cloudflare the attacker never sees raw silence** — the connection thorngate drops belongs to `cloudflared`, so Cloudflare converts a `drop` into an immediate `502`-style error page and a `tarpit` into a `524` after its ~100s origin timeout. The `403` fingerprint is hidden either way, and `tarpit` still stalls the scanner for the full wait.
 
 ### Routing
 
@@ -285,8 +310,10 @@ go build -o thorngate ./cmd/thorngate
 ./thorngate -config config.json   # listens on :8765
 
 # simulate a Cloudflare request that trips the ".php contains" honeypot
-curl -H "Cf-Connecting-Ip: 9.9.9.9" http://localhost:8765/x/shell.php   # 403, IP now blocked
-curl -H "Cf-Connecting-Ip: 9.9.9.9" http://localhost:8765/             # 403 forever
+# (default block_action is tarpit — curl hangs until tarpit_duration, then the
+#  connection drops with no response; set "block_action": "forbidden" for a 403)
+curl -m 5 -H "Cf-Connecting-Ip: 9.9.9.9" http://localhost:8765/x/shell.php   # hangs, IP now blocked
+curl -m 5 -H "Cf-Connecting-Ip: 9.9.9.9" http://localhost:8765/             # ghosted forever
 
 go test ./...   # exercises the matchers
 ```

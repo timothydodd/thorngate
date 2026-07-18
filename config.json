@@ -6,6 +6,9 @@
     "127.0.0.1",
     "10.0.0.0/8"
   ],
+  "block_action": "tarpit",
+  "tarpit_duration": "100s",
+  "tarpit_max": 512,
   "honeypots": [
     "/wp-admin",
     "/wp-login.php",

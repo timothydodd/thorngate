@@ -1,6 +1,11 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+/* Tailwind 4 is configured here (CSS-first) instead of tailwind.config.js.
+   The dark: variant follows prefers-color-scheme by default, matching the old
+   darkMode: 'media' setting. */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, sans-serif;
+}
 
 html,
 body,
@@ -10,5 +15,5 @@ body,
 
 body {
   @apply bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-200;
-  font-family: theme('fontFamily.sans');
+  font-family: var(--font-sans);
 }

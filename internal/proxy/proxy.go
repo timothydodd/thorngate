@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"thorngate/internal/blacklist"
@@ -29,6 +30,8 @@ type WAF struct {
 	hist      *history.Tracker       // nil unless request_log is enabled
 	stats     *stats.Collector       // nil unless stats is enabled
 	noLog     []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
+
+	tarpitting atomic.Int64 // connections currently held by the tarpit
 }
 
 type hostRoute struct {
@@ -110,20 +113,21 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// so blacklist/honeypot/temp-ban bookkeeping is irrelevant for them too.
 	quiet := len(w.noLog) > 0 && blacklist.Matches(w.noLog, ip)
 
-	// 1. Already blacklisted? Hard 403, no upstream contact.
+	// 1. Already blacklisted? Denied with no upstream contact.
 	if w.bl.IsBlocked(ip) {
+		action := w.denyAction()
 		if w.stats != nil {
 			w.stats.Request(true)
-			w.observe(ip, r, http.StatusForbidden, "blocked", "", 0)
+			w.observeDenied(ip, r, "blocked", action)
 		}
-		forbidden(rw)
+		w.deny(action, rw, r)
 		return
 	}
 	if w.stats != nil && !quiet {
 		w.stats.Request(false)
 	}
 
-	// 2. Honeypot hit? Blacklist and 403.
+	// 2. Honeypot hit? Blacklist and deny.
 	if pattern, hit := w.honeypot(r.URL.Path); hit {
 		if w.bl.Add(ip, "honeypot", pattern) {
 			log.Printf("BLACKLISTED ip=%s path=%s honeypot=%s ua=%q total=%d",
@@ -133,10 +137,11 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				w.stats.Honeypot()
 			}
 		}
+		action := w.denyAction()
 		if w.stats != nil && !quiet {
-			w.observe(ip, r, http.StatusForbidden, "honeypot", "", 0)
+			w.observeDenied(ip, r, "honeypot", action)
 		}
-		forbidden(rw)
+		w.deny(action, rw, r)
 		return
 	}
 
@@ -269,6 +274,89 @@ func (w *WAF) honeypot(reqPath string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// denyAction decides how a blocked request will be ended — "forbidden",
+// "drop", or "tarpit" — so stats can record what actually happens. Choosing
+// "tarpit" reserves one of the TarpitMax concurrent slots (so an attacker who
+// notices the tarpit can't exhaust file descriptors); when none is free the
+// request degrades to "drop". A reserved slot is released by deny.
+func (w *WAF) denyAction() string {
+	switch w.cfg.BlockAction {
+	case "drop":
+		return "drop"
+	case "tarpit":
+		if w.tarpitting.Add(1) > int64(w.cfg.TarpitMax) {
+			w.tarpitting.Add(-1)
+			return "drop"
+		}
+		return "tarpit"
+	default:
+		return "forbidden"
+	}
+}
+
+// deny ends a blocked request with the action denyAction picked: a plain 403,
+// an immediate connection drop, or a tarpit that holds the connection open —
+// never responding — until the client gives up or the configured cap elapses.
+func (w *WAF) deny(action string, rw http.ResponseWriter, r *http.Request) {
+	switch action {
+	case "drop":
+		drop(rw)
+	case "tarpit":
+		t := time.NewTimer(w.cfg.TarpitDur())
+		select {
+		case <-r.Context().Done(): // client hung up first
+		case <-t.C:
+		}
+		t.Stop()
+		w.tarpitting.Add(-1)
+		drop(rw)
+	default:
+		forbidden(rw)
+	}
+}
+
+// observeDenied records a denied (blocked/honeypot) request in the stats feed.
+// Caller has already checked w.stats != nil. A written 403 is recorded by its
+// status; drop/tarpit write nothing, so status is 0 and Deny says what happened.
+func (w *WAF) observeDenied(ip string, r *http.Request, outcome, action string) {
+	status := 0
+	if action == "forbidden" {
+		status = http.StatusForbidden
+	}
+	w.stats.Observe(stats.Event{
+		Time:    time.Now().UTC(),
+		IP:      ip,
+		Method:  r.Method,
+		Host:    r.Host,
+		Path:    r.URL.Path,
+		Query:   r.URL.RawQuery,
+		Status:  status,
+		Outcome: outcome,
+		Deny:    denyLabel(action),
+	})
+}
+
+// denyLabel is the Deny value recorded in stats: empty for a written 403.
+func denyLabel(action string) string {
+	if action == "forbidden" {
+		return ""
+	}
+	return action
+}
+
+// drop severs the client connection without writing a response. If the
+// connection can't be hijacked (e.g. HTTP/2, or a test recorder), panicking
+// with ErrAbortHandler makes net/http abort the response without a stack trace.
+func drop(rw http.ResponseWriter) {
+	if hj, ok := rw.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+			return
+		}
+	}
+	panic(http.ErrAbortHandler)
 }
 
 func forbidden(rw http.ResponseWriter) {

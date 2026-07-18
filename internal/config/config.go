@@ -29,6 +29,26 @@ type Config struct {
 	// Any external IP that matches one is blacklisted immediately.
 	Honeypots []Honeypot `json:"honeypots"`
 
+	// BlockAction is what a blocked client (blacklisted IP or honeypot hit)
+	// receives. "tarpit" (default) never responds at all: the connection is
+	// held open until the client gives up or TarpitDuration elapses, then
+	// dropped. "drop" closes the connection immediately without writing any
+	// response. "forbidden" answers with a plain 403.
+	BlockAction string `json:"block_action"`
+
+	// TarpitDuration caps how long a tarpitted connection is held open (Go
+	// duration). Default "100s", roughly Cloudflare's own origin timeout.
+	// Only used when BlockAction is "tarpit".
+	TarpitDuration string `json:"tarpit_duration"`
+
+	// TarpitMax caps how many connections may be tarpitted at once, so an
+	// attacker who notices the tarpit can't exhaust file descriptors by piling
+	// up held connections. Past the cap, blocked requests are dropped
+	// immediately instead. Default 512.
+	TarpitMax int `json:"tarpit_max"`
+
+	tarpitDur time.Duration
+
 	// Whitelist are IPs that are never blacklisted, e.g. your own office IP or
 	// health-check sources. Each entry may be a single IP ("1.2.3.4"), a CIDR
 	// ("10.0.0.0/8"), or an octet wildcard ("107.214.211.*"). An entry may also
@@ -286,6 +306,9 @@ func (c *Config) WhitelistSpecs() []string {
 	return specs
 }
 
+// TarpitDur returns the parsed tarpit hold cap.
+func (c *Config) TarpitDur() time.Duration { return c.tarpitDur }
+
 // NoLogSpecs returns the address specs of whitelist entries flagged no_log, for
 // building the set of IPs excluded from logging and stats.
 func (c *Config) NoLogSpecs() []string {
@@ -426,6 +449,27 @@ func Load(filePath string) (*Config, error) {
 		if err := c.Honeypots[i].compile(); err != nil {
 			return nil, fmt.Errorf("config: honeypot %d: %w", i, err)
 		}
+	}
+	switch c.BlockAction {
+	case "":
+		c.BlockAction = "tarpit"
+	case "forbidden", "drop", "tarpit":
+	default:
+		return nil, fmt.Errorf("config: block_action %q (want forbidden|drop|tarpit)", c.BlockAction)
+	}
+	if c.TarpitDuration == "" {
+		c.TarpitDuration = "100s"
+	}
+	td, err := time.ParseDuration(c.TarpitDuration)
+	if err != nil {
+		return nil, fmt.Errorf("config: tarpit_duration %q: %w", c.TarpitDuration, err)
+	}
+	if td <= 0 {
+		return nil, fmt.Errorf("config: tarpit_duration %q: must be positive", c.TarpitDuration)
+	}
+	c.tarpitDur = td
+	if c.TarpitMax <= 0 {
+		c.TarpitMax = 512
 	}
 	if c.TempBan != nil && c.TempBan.Enabled {
 		if err := c.TempBan.compile(); err != nil {

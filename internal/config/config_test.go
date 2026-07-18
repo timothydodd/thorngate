@@ -2,7 +2,10 @@ package config
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func mustCompile(t *testing.T, h Honeypot) Honeypot {
@@ -140,5 +143,47 @@ func TestWhitelistEntryUnmarshal(t *testing.T) {
 	noLog := c.NoLogSpecs()
 	if len(noLog) != 1 || noLog[0] != "9.9.9.0/24" {
 		t.Errorf("NoLogSpecs = %v, want [9.9.9.0/24]", noLog)
+	}
+}
+
+func loadJSON(t *testing.T, js string) (*Config, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(js), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return Load(p)
+}
+
+func TestBlockAction(t *testing.T) {
+	// Tarpit is the default action, with the hold cap and concurrency cap
+	// defaulted too.
+	c, err := loadJSON(t, `{"upstream":"10.0.0.1"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BlockAction != "tarpit" {
+		t.Errorf("default block_action = %q, want tarpit", c.BlockAction)
+	}
+	if c.TarpitDur() != 100*time.Second {
+		t.Errorf("default tarpit cap = %v, want 100s", c.TarpitDur())
+	}
+	if c.TarpitMax != 512 {
+		t.Errorf("default tarpit_max = %d, want 512", c.TarpitMax)
+	}
+
+	c, err = loadJSON(t, `{"upstream":"10.0.0.1","block_action":"tarpit","tarpit_duration":"30s"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.BlockAction != "tarpit" || c.TarpitDur() != 30*time.Second {
+		t.Errorf("got action=%q cap=%v, want tarpit/30s", c.BlockAction, c.TarpitDur())
+	}
+
+	if _, err = loadJSON(t, `{"upstream":"10.0.0.1","block_action":"nuke"}`); err == nil {
+		t.Error("unknown block_action should be rejected")
+	}
+	if _, err = loadJSON(t, `{"upstream":"10.0.0.1","tarpit_duration":"-5s"}`); err == nil {
+		t.Error("non-positive tarpit_duration should be rejected")
 	}
 }

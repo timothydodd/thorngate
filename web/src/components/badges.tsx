@@ -1,10 +1,19 @@
 // Shared presentational helpers for request status and outcome.
 
 export function statusColor(code: number): string {
+  if (code === 0) return 'text-slate-400 dark:text-slate-500'
   if (code >= 500) return 'text-rose-500'
   if (code >= 400) return 'text-amber-500'
   if (code >= 300) return 'text-sky-500'
   return 'text-emerald-500'
+}
+
+// A denied request may never get a response written (block_action
+// drop/tarpit); show what happened to it instead of a status code.
+export function formatStatus(code: number, deny?: string): string {
+  if (deny === 'tarpit') return 'tarpit'
+  if (deny === 'drop') return 'dropped'
+  return code === 0 ? '(ghosted)' : String(code)
 }
 
 const OUTCOME_STYLES: Record<string, string> = {

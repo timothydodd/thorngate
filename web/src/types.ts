@@ -9,6 +9,7 @@ export interface RequestEvent {
   query?: string
   status: number
   outcome: 'proxied' | 'blocked' | 'honeypot' | string
+  deny?: 'tarpit' | 'drop' | string
   upstream?: string
   bytes: number
 }

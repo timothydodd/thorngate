@@ -1,6 +1,6 @@
 import { ReactNode, useEffect } from 'react'
 import { RequestEvent } from '../types'
-import { OutcomeBadge, formatBytes, statusColor } from './badges'
+import { OutcomeBadge, formatBytes, formatStatus, statusColor } from './badges'
 
 function Row({ label, value, mono }: { label: string; value: ReactNode; mono?: boolean }) {
   return (
@@ -41,7 +41,7 @@ export default function DetailsModal({ event, onClose }: { event: RequestEvent; 
           <Row label="Upstream" value={event.upstream || '—'} mono />
           <Row
             label="Status"
-            value={<span className={'font-mono ' + statusColor(event.status)}>{event.status}</span>}
+            value={<span className={'font-mono ' + statusColor(event.status)}>{formatStatus(event.status, event.deny)}</span>}
           />
           <Row label="Sent" value={event.outcome === 'proxied' ? formatBytes(event.bytes) : '—'} />
           <Row label="Outcome" value={<OutcomeBadge outcome={event.outcome} />} />

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import { RecentResponse, RequestEvent } from '../types'
 import DetailsModal from './DetailsModal'
-import { OutcomeBadge, formatBytes, statusColor } from './badges'
+import { OutcomeBadge, formatBytes, formatStatus, statusColor } from './badges'
 
 const PAGE_SIZE = 50
 // An IP gets a request-count badge once it has more than this many requests
@@ -121,7 +121,7 @@ export default function RecentRequests() {
                     >
                       {e.upstream || '—'}
                     </td>
-                    <td className={'px-3 py-1.5 font-mono ' + statusColor(e.status)}>{e.status}</td>
+                    <td className={'px-3 py-1.5 font-mono ' + statusColor(e.status)}>{formatStatus(e.status, e.deny)}</td>
                     <td className="px-3 py-1.5 text-slate-500 whitespace-nowrap">
                       {e.outcome === 'proxied' ? formatBytes(e.bytes) : '—'}
                     </td>
