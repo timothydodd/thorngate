@@ -20,22 +20,41 @@ import (
 	"thorngate/internal/stats"
 )
 
+// Archiver receives every observed request for long-term storage
+// (internal/archive). Append must not block.
+type Archiver interface {
+	Append(stats.Event)
+}
+
 // WAF is an http.Handler that blacklists honeypot hitters and reverse-proxies
 // everything else to the default upstream (or a hostname override).
 type WAF struct {
-	cfg       *config.Config
+	// rules holds the settings Reload can swap while serving. Each request
+	// loads it once, so it never sees a mix of old and new settings.
+	rules atomic.Pointer[rules]
+
 	bl        *blacklist.Blacklist
 	def       *httputil.ReverseProxy // default upstream for all traffic
 	defTarget string                 // resolved default upstream URL, for logging
 	routes    []hostRoute            // optional hostname overrides
+	tempBan   *config.TempBan        // nil unless temp_ban is enabled
 	mon       *monitor.Monitor       // nil unless temp_ban is enabled
+	esc       *monitor.Monitor       // nil unless temp_ban.escalate_after > 0
 	hist      *history.Tracker       // nil unless request_log is enabled
 	stats     *stats.Collector       // nil unless stats is enabled
-	noLog     []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
+	arch      Archiver               // nil unless stats.archive is set
 
 	tarpitting atomic.Int64  // connections currently held by the tarpit
 	stop       chan struct{} // closed by ReleaseTarpits at shutdown
 	stopOnce   sync.Once
+}
+
+// rules are the live-reloadable settings: everything read from cfg on the
+// request path (honeypots, block action, tarpit, client IP / country headers,
+// ipv6_ban_prefix) plus the no_log set derived from the whitelist.
+type rules struct {
+	cfg   *config.Config
+	noLog []*net.IPNet // whitelist entries flagged no_log: skip stats/history
 }
 
 type hostRoute struct {
@@ -46,7 +65,8 @@ type hostRoute struct {
 
 // New builds the WAF handler from config and a blacklist store.
 func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
-	w := &WAF{cfg: cfg, bl: bl, noLog: blacklist.ParseNets(cfg.NoLogSpecs()), stop: make(chan struct{})}
+	w := &WAF{bl: bl, stop: make(chan struct{})}
+	w.rules.Store(newRules(cfg))
 
 	tr := newTransport()
 	def, defTarget, err := newProxy(cfg.Upstream, tr)
@@ -64,23 +84,20 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 	}
 
 	if cfg.TempBan != nil && cfg.TempBan.Enabled {
-		win := cfg.TempBan.WindowDur()
-		w.mon = monitor.New(cfg.TempBan.Max, win)
-		go func() {
-			for range time.Tick(win) {
-				w.mon.Sweep()
-			}
-		}()
+		tb := cfg.TempBan
+		w.tempBan = tb
+		w.mon = monitor.New(tb.Max, tb.WindowDur())
+		go sweepEvery(tb.WindowDur(), w.mon.Sweep)
+		if tb.EscalateAfter > 0 {
+			w.esc = monitor.New(tb.EscalateAfter, tb.EscalateWindowDur())
+			go sweepEvery(min(tb.EscalateWindowDur(), time.Hour), w.esc.Sweep)
+		}
 	}
 
 	if cfg.RequestLog != nil && cfg.RequestLog.Enabled() {
 		rl := cfg.RequestLog
 		w.hist = history.New(rl.Depth, rl.MaxIPs, rl.TTLDur())
-		go func() {
-			for range time.Tick(rl.TTLDur()) {
-				w.hist.Sweep()
-			}
-		}()
+		go sweepEvery(rl.TTLDur(), w.hist.Sweep)
 	}
 
 	if cfg.Stats != nil && cfg.Stats.Enabled() {
@@ -90,9 +107,34 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 	return w, nil
 }
 
+func newRules(cfg *config.Config) *rules {
+	return &rules{cfg: cfg, noLog: blacklist.ParseNets(cfg.NoLogSpecs())}
+}
+
+func sweepEvery(d time.Duration, sweep func()) {
+	for range time.Tick(d) {
+		sweep()
+	}
+}
+
+// SetArchive attaches long-term request storage. Call before serving; requests
+// are archived only when stats are enabled.
+func (w *WAF) SetArchive(a Archiver) { w.arch = a }
+
+// Reload swaps in the live-reloadable settings from cfg (see rules) and the
+// blacklist's whitelist. Settings that need a restart are left as they were;
+// config.ReloadBlocked reports which ones differ.
+func (w *WAF) Reload(cfg *config.Config) {
+	w.rules.Store(newRules(cfg))
+	w.bl.SetWhitelist(cfg.WhitelistSpecs())
+}
+
 // Stats returns the traffic collector, or nil if stats are disabled. The admin
 // portal reads it to render the dashboard.
 func (w *WAF) Stats() *stats.Collector { return w.stats }
+
+// Tarpitting returns how many connections the tarpit is holding right now.
+func (w *WAF) Tarpitting() int64 { return w.tarpitting.Load() }
 
 // ReleaseTarpits ends every tarpit hold (current and future) immediately. It is
 // registered with http.Server.RegisterOnShutdown so held connections — up to
@@ -130,42 +172,44 @@ func newProxy(upstream string, tr http.RoundTripper) (*httputil.ReverseProxy, st
 }
 
 func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	ip := w.clientIP(r)
+	rl := w.rules.Load()
+	c := rl.cfg
+	ip := clientIP(r, c.ClientIPHeader)
 
 	// no_log whitelist entries (e.g. your own monitors) are kept out of the
 	// stats feed and request history entirely. They can never be blacklisted,
 	// so blacklist/honeypot/temp-ban bookkeeping is irrelevant for them too.
-	quiet := len(w.noLog) > 0 && blacklist.Matches(w.noLog, ip)
+	quiet := len(rl.noLog) > 0 && blacklist.Matches(rl.noLog, ip)
 
 	// 1. Already blacklisted? Denied with no upstream contact.
 	if w.bl.IsBlocked(ip) {
-		action := w.denyAction()
+		action := w.denyAction(c)
 		if w.stats != nil {
 			w.stats.Request(true)
-			w.observeDenied(ip, r, "blocked", action)
+			w.observeDenied(c, ip, r, "blocked", action)
 		}
-		w.deny(action, rw, r)
+		w.deny(c, action, rw, r)
 		return
 	}
 	if w.stats != nil && !quiet {
 		w.stats.Request(false)
 	}
 
-	// 2. Honeypot hit? Blacklist and deny.
-	if pattern, hit := w.honeypot(r.URL.Path); hit {
-		if w.bl.Add(ip, "honeypot", pattern) {
-			log.Printf("BLACKLISTED ip=%s path=%s honeypot=%s ua=%q total=%d",
-				ip, r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
+	// 2. Honeypot hit? Blacklist (the IP, or its IPv6 range) and deny.
+	if pattern, hit := honeypot(c, r.URL.Path); hit {
+		if key := w.banKeyFor(c, ip); key != "" && w.bl.Add(key, "honeypot", pattern) {
+			log.Printf("BLACKLISTED ip=%s%s path=%s honeypot=%s ua=%q total=%d",
+				ip, rangeNote(ip, key), r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
 			w.dumpHistory(ip, "honeypot")
 			if w.stats != nil {
 				w.stats.Honeypot()
 			}
 		}
-		action := w.denyAction()
+		action := w.denyAction(c)
 		if w.stats != nil && !quiet {
-			w.observeDenied(ip, r, "honeypot", action)
+			w.observeDenied(c, ip, r, "honeypot", action)
 		}
-		w.deny(action, rw, r)
+		w.deny(c, action, rw, r)
 		return
 	}
 
@@ -185,29 +229,51 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if w.stats != nil {
 		w.stats.Status(sw.status)
 		w.stats.Bytes(sw.bytes)
-		w.observe(ip, r, sw.status, "proxied", target, sw.bytes)
+		e := w.event(c, ip, r)
+		e.Status, e.Outcome, e.Upstream, e.Bytes = sw.status, "proxied", target, sw.bytes
+		w.observe(e)
 	}
 	if w.mon != nil {
-		w.monitorResponse(ip, sw.status)
+		w.monitorResponse(c, ip, sw.status)
 	}
 }
 
-// observe records a request in the stats recent-requests feed. Caller has
-// already checked w.stats != nil. upstream is empty (and bytes zero) when the
-// request never reached one (blocked / honeypot).
-func (w *WAF) observe(ip string, r *http.Request, status int, outcome, upstream string, bytes int64) {
-	w.stats.Observe(stats.Event{
-		Time:     time.Now().UTC(),
-		IP:       ip,
-		Method:   r.Method,
-		Host:     r.Host,
-		Path:     r.URL.Path,
-		Query:    r.URL.RawQuery,
-		Status:   status,
-		Outcome:  outcome,
-		Upstream: upstream,
-		Bytes:    bytes,
-	})
+// Caps on event fields, so one oversized request can't bloat the in-memory
+// feed or the archive.
+const (
+	maxPathLen  = 2048
+	maxQueryLen = 1024
+	maxUALen    = 512
+)
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+// event fills in the request-derived fields of a feed event.
+func (w *WAF) event(c *config.Config, ip string, r *http.Request) stats.Event {
+	return stats.Event{
+		Time:    time.Now().UTC(),
+		IP:      ip,
+		Method:  r.Method,
+		Host:    r.Host,
+		Path:    truncate(r.URL.Path, maxPathLen),
+		Query:   truncate(r.URL.RawQuery, maxQueryLen),
+		Country: truncate(r.Header.Get(c.CountryHeader), 8),
+		UA:      truncate(r.UserAgent(), maxUALen),
+	}
+}
+
+// observe records an event in the stats feed and, when enabled, the archive.
+// Caller has already checked w.stats != nil.
+func (w *WAF) observe(e stats.Event) {
+	w.stats.Observe(e)
+	if w.arch != nil {
+		w.arch.Append(e)
+	}
 }
 
 // recordRequest remembers a request that reached an upstream so it can be
@@ -256,19 +322,53 @@ func (w *WAF) upstreamFor(r *http.Request) (*httputil.ReverseProxy, string) {
 	return w.def, w.defTarget
 }
 
+// banKeyFor returns what an automatic ban of ip should cover — the IP, or its
+// IPv6 range per ipv6_ban_prefix — or "" if ip is whitelisted: a whitelisted
+// client's neighbours in its IPv6 range must not be banned on its account.
+func (w *WAF) banKeyFor(c *config.Config, ip string) string {
+	if w.bl.IsWhitelisted(ip) {
+		return ""
+	}
+	return blacklist.BanKey(ip, c.IPv6BanPrefix)
+}
+
+// rangeNote is a log suffix naming the range banned when it is wider than ip.
+func rangeNote(ip, key string) string {
+	if key == ip {
+		return ""
+	}
+	return " range=" + key
+}
+
 // monitorResponse records a strike for bad responses and applies a temporary
-// ban once an IP crosses the configured threshold.
-func (w *WAF) monitorResponse(ip string, status int) {
-	tb := w.cfg.TempBan
+// ban once an IP (or IPv6 range) crosses the configured threshold. With
+// escalation on, enough temp-bans within the escalation window make it
+// permanent.
+func (w *WAF) monitorResponse(c *config.Config, ip string, status int) {
+	tb := w.tempBan
 	if !tb.IsBadCode(status) {
 		return
 	}
-	if w.mon.Strike(ip) && w.bl.AddTemp(ip, "rate-limit", tb.BanDur()) {
-		log.Printf("TEMP-BANNED ip=%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
-			ip, tb.BanDuration, tb.Max, tb.Window, status, w.bl.Count())
-		w.dumpHistory(ip, "rate-limit")
+	// Strikes are counted per ban key, so an IPv6 scanner rotating through
+	// its /64 accumulates them as one client.
+	key := w.banKeyFor(c, ip)
+	if key == "" {
+		return
+	}
+	if !w.mon.Strike(key) || !w.bl.AddTemp(key, "rate-limit", tb.BanDur()) {
+		return
+	}
+	log.Printf("TEMP-BANNED ip=%s%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
+		ip, rangeNote(ip, key), tb.BanDuration, tb.Max, tb.Window, status, w.bl.Count())
+	w.dumpHistory(ip, "rate-limit")
+	if w.stats != nil {
+		w.stats.TempBan()
+	}
+	if w.esc != nil && w.esc.Strike(key) && w.bl.Add(key, "repeat-offender", "") {
+		log.Printf("ESCALATED ip=%s%s to a permanent ban (%d temp-bans within %s)",
+			ip, rangeNote(ip, key), tb.EscalateAfter, tb.EscalateWindow)
 		if w.stats != nil {
-			w.stats.TempBan()
+			w.stats.Escalated()
 		}
 	}
 }
@@ -279,8 +379,8 @@ func (w *WAF) monitorResponse(ip string, status int) {
 // "2001:db8::1") so each client maps to exactly one blacklist key. A header
 // value that isn't an IP is returned as-is rather than falling back to the
 // peer, which is cloudflared itself and must never be banned.
-func (w *WAF) clientIP(r *http.Request) string {
-	if h := r.Header.Get(w.cfg.ClientIPHeader); h != "" {
+func clientIP(r *http.Request, header string) string {
+	if h := r.Header.Get(header); h != "" {
 		// Header may be a single IP (CF) or a comma list (XFF).
 		if i := strings.IndexByte(h, ','); i >= 0 {
 			h = h[:i]
@@ -304,11 +404,11 @@ func canonicalIP(s string) string {
 // honeypot checks the request path against the honeypots. The cleaned path is
 // checked too: "/x/../wp-admin", "//wp-admin" and (on IIS) "/x\..\wp-admin"
 // all reach the upstream's /wp-admin though the raw path doesn't start with it.
-func (w *WAF) honeypot(reqPath string) (string, bool) {
+func honeypot(c *config.Config, reqPath string) (string, bool) {
 	if clean := cleanPath(reqPath); clean != reqPath {
-		return w.cfg.Honeypots.Match(reqPath, clean)
+		return c.Honeypots.Match(reqPath, clean)
 	}
-	return w.cfg.Honeypots.Match(reqPath)
+	return c.Honeypots.Match(reqPath)
 }
 
 // cleanPath resolves "." / ".." / duplicate slashes (and backslashes, which IIS
@@ -332,12 +432,12 @@ func cleanPath(p string) string {
 // "tarpit" reserves one of the TarpitMax concurrent slots (so an attacker who
 // notices the tarpit can't exhaust file descriptors); when none is free the
 // request degrades to "drop". A reserved slot is released by deny.
-func (w *WAF) denyAction() string {
-	switch w.cfg.BlockAction {
+func (w *WAF) denyAction(c *config.Config) string {
+	switch c.BlockAction {
 	case "drop":
 		return "drop"
 	case "tarpit":
-		if w.tarpitting.Add(1) > int64(w.cfg.TarpitMax) {
+		if w.tarpitting.Add(1) > int64(c.TarpitMax) {
 			w.tarpitting.Add(-1)
 			return "drop"
 		}
@@ -350,12 +450,12 @@ func (w *WAF) denyAction() string {
 // deny ends a blocked request with the action denyAction picked: a plain 403,
 // an immediate connection drop, or a tarpit that holds the connection open —
 // never responding — until the client gives up or the configured cap elapses.
-func (w *WAF) deny(action string, rw http.ResponseWriter, r *http.Request) {
+func (w *WAF) deny(c *config.Config, action string, rw http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "drop":
 		drop(rw)
 	case "tarpit":
-		t := time.NewTimer(w.cfg.TarpitDur())
+		t := time.NewTimer(c.TarpitDur())
 		select {
 		case <-r.Context().Done(): // client hung up first
 		case <-w.stop: // server shutting down
@@ -372,22 +472,13 @@ func (w *WAF) deny(action string, rw http.ResponseWriter, r *http.Request) {
 // observeDenied records a denied (blocked/honeypot) request in the stats feed.
 // Caller has already checked w.stats != nil. A written 403 is recorded by its
 // status; drop/tarpit write nothing, so status is 0 and Deny says what happened.
-func (w *WAF) observeDenied(ip string, r *http.Request, outcome, action string) {
-	status := 0
+func (w *WAF) observeDenied(c *config.Config, ip string, r *http.Request, outcome, action string) {
+	e := w.event(c, ip, r)
 	if action == "forbidden" {
-		status = http.StatusForbidden
+		e.Status = http.StatusForbidden
 	}
-	w.stats.Observe(stats.Event{
-		Time:    time.Now().UTC(),
-		IP:      ip,
-		Method:  r.Method,
-		Host:    r.Host,
-		Path:    r.URL.Path,
-		Query:   r.URL.RawQuery,
-		Status:  status,
-		Outcome: outcome,
-		Deny:    denyLabel(action),
-	})
+	e.Outcome, e.Deny = outcome, denyLabel(action)
+	w.observe(e)
 }
 
 // denyLabel is the Deny value recorded in stats: empty for a written 403.
