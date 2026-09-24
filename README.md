@@ -6,10 +6,16 @@
 
 A tiny, zero-dependency Go reverse-proxy WAF that sits behind a **Cloudflare Tunnel** and in front of your web/API services — a gate at the mouth of the tunnel that snags intruders. It:
 
-- Reverse-proxies configured **path prefixes → internal upstreams** (k8s services or raw IPs), including **WebSocket / SignalR** (protocol-upgrade) connections.
-- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and ghosted on every future request — by default the connection is tarpitted (held open, never answered) and then dropped; `block_action` can switch this to an instant drop or a plain `403`.
+- Reverse-proxies all traffic to a **default upstream**, with optional **hostname → upstream** overrides (k8s services or raw IPs), including **WebSocket / SignalR** (protocol-upgrade) connections.
+- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and ghosted on every future request — by default the connection is tarpitted (held open, never answered) and then dropped; `block_action` can switch this to an instant drop or a plain `403`. IPv6 clients are banned by their whole **/64**, since scanners rotate through it.
+- Optionally **temp-bans** clients that rack up bad responses, and **escalates** repeat offenders to permanent bans.
 - Resolves the real external IP from Cloudflare's `Cf-Connecting-Ip` header.
-- Persists the blacklist to disk so it survives restarts.
+- Persists the blacklist to disk so it survives restarts, and can keep **weeks of searchable request history** on disk.
+- Ships an optional **admin portal**: traffic overview, request search by IP / range / text, per-IP profiles, one-click bans, blocklist import/export, live config reload, and Prometheus metrics.
+
+<p align="center">
+  <img src="assets/screenshots/overview.png" alt="thorngate admin portal overview" width="820">
+</p>
 
 Standard library only — no modules to fetch, `go build` works offline. Default listen port: **8765**.
 
@@ -22,7 +28,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 1. Read client IP from `Cf-Connecting-Ip`.
 2. If IP is blacklisted → tarpit (default; or drop/403, per `block_action`).
 3. If the path matches a honeypot → blacklist the IP, persist, tarpit.
-4. Otherwise proxy to the upstream with the longest matching path prefix.
+4. Otherwise proxy to the route whose `host` matches, or the default upstream.
 
 `/healthz` is reserved for k8s probes (never proxied, never a honeypot).
 
@@ -36,7 +42,8 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 │   ├── blacklist/        # thread-safe, file-persisted blocklist
 │   ├── monitor/          # per-IP sliding-window strike counter (temp bans)
 │   ├── history/          # bounded per-IP request history (dumped on ban)
-│   ├── stats/            # in-memory traffic counters for the dashboard
+│   ├── stats/            # in-memory traffic counters + history query layer
+│   ├── archive/          # on-disk hourly request history (gzipped + indexed)
 │   ├── auth/             # admin credential store (PBKDF2) + sessions
 │   ├── admin/            # admin API + embedded React portal (internal/admin/dist)
 │   └── proxy/            # IP extraction, honeypot check, host routing
@@ -53,6 +60,8 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 |-------|---------|
 | `listen` | listen address, default `:8765` |
 | `client_ip_header` | header with the real IP — `Cf-Connecting-Ip` for Cloudflare |
+| `country_header` | header with the client's country code, recorded in the request feed — default `Cf-Ipcountry` (Cloudflare sets it when IP geolocation is on) |
+| `ipv6_ban_prefix` | automatic bans of an IPv6 client cover its whole network of this prefix length — default `64`; `128` bans single addresses (see below) |
 | `blacklist_file` | where to persist blocked IPs (mount a volume in k8s) |
 | `whitelist` | IPs never blacklisted (your own IP, internal ranges) — see below |
 | `honeypots` | patterns that trigger an instant blacklist (see below) |
@@ -64,7 +73,9 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `temp_ban` | optional auto-ban for too many bad responses (see below) |
 | `admin` | optional login-protected admin portal + API on a separate port (see below) |
 | `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
-| `stats` | in-memory traffic counters for the admin dashboard (on by default, see below) |
+| `stats` | traffic counters for the admin dashboard (on by default), plus optional on-disk request history via `stats.archive` (see below) |
+
+Unknown keys are an **error**: a typo like `"tempban"` would otherwise silently leave a protection switched off, so thorngate refuses to start instead. Most settings can be changed without a restart — see [Reloading config](#reloading-config).
 
 ### Whitelist (`whitelist`)
 
@@ -111,6 +122,15 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 - Matching is **case-insensitive** by default, since case-insensitive upstreams (IIS/ASP.NET) serve `/WP-Admin` just like `/wp-admin`. Add `"case_sensitive": true` to an object-form honeypot to opt out.
 - Paths are checked both as sent and **cleaned** (`//wp-admin`, `/x/../wp-admin` and `/x\..\wp-admin` all count as `/wp-admin`), since that is what an upstream would serve.
 - A honeypot that matches the site root `/` (e.g. `""`, `"/"`, `{"pattern": ".*", "match": "regex"}`) is rejected at startup — it would ban every visitor on their first request.
+
+### IPv6 range bans (`ipv6_ban_prefix`)
+
+An IPv6 client almost always holds an entire `/64` and can hop to any of its 2⁶⁴ addresses at will, so banning the one address that tripped a honeypot achieves nothing — the next request simply comes from `…::2`. thorngate therefore bans the client's whole network: a honeypot hit or temp-ban from `2001:db8:bad:7::2` bans `2001:db8:bad:7::/64`, and temp-ban strikes are counted per `/64` too, so a scanner rotating addresses adds up as one client.
+
+- Default `64` (the standard allocation for a single subscriber). Set `128` to ban single addresses, or e.g. `56`/`48` to be more aggressive.
+- IPv4 is unaffected — single addresses, always.
+- A whitelisted IPv6 client never bans its range on its own account, and stays reachable even if its range is banned for someone else's behaviour.
+- Range bans are cheap: ranges are grouped by prefix length, so a lookup costs one map probe per distinct prefix length no matter how many ranges are banned.
 
 ### Block action (`block_action`)
 
@@ -175,9 +195,12 @@ Honeypots are an *instant, permanent* ban. `temp_ban` is the softer, optional la
 | `max` | bad responses allowed within `window` before a ban | `20` |
 | `window` | sliding counting window (Go duration) | `"1m"` |
 | `ban_duration` | how long the temporary ban lasts (Go duration) | `"15m"` |
+| `escalate_after` | make it **permanent** once the same IP (or IPv6 range) has been temp-banned this many times within `escalate_window`; `0` disables | `0` |
+| `escalate_window` | look-back for `escalate_after` (Go duration) | `"24h"` |
 
 - Bans **auto-expire** after `ban_duration` (removed on the IP's next request or by a once-a-minute sweep, and dropped on restart if already lapsed).
 - `window` and `ban_duration` must be positive durations; config loading fails otherwise.
+- **Escalation** catches scanners that simply wait out each temp-ban: with `"escalate_after": 3`, the third temp-ban within 24h becomes a permanent `repeat-offender` ban (logged as `ESCALATED`, counted in the dashboard and `/metrics`).
 - Whitelisted IPs are never temp-banned; a honeypot (permanent) ban always outranks a temporary one.
 - Omit the whole `temp_ban` block to disable it (zero overhead — responses aren't even wrapped).
 
@@ -239,62 +262,119 @@ It is **on by default** — the headline totals are lock-free atomics and the ti
 | `save_interval` | how often the stats file is rewritten (Go duration); ignored when `file` is empty | `"1m"` |
 
 - Without `file`, counters live in memory only and reset to zero on restart. With it, at most the last `save_interval` of traffic is lost on a crash (a graceful shutdown saves on exit). Saving happens on a background timer, never on the request path.
-- Read them programmatically via `GET /admin/stats` (counters + series) and `GET /admin/stats/recent` (the paginated 24-hour feed) — same bearer token as the rest of the admin API.
+- Read them programmatically via `GET /admin/stats` (counters + series) and `GET /admin/requests` (the searchable request feed) — same bearer token as the rest of the admin API.
+
+#### Request history on disk (`stats.archive`)
+
+The in-memory feed only holds the last few thousand requests. Add an `archive` block to keep **weeks of searchable history** on disk instead — without holding it in memory:
+
+```json
+"stats": {
+  "archive": { "dir": "/data/requests", "retention_days": 30 }
+}
+```
+
+| field | meaning | default |
+|-------|---------|---------|
+| `dir` | directory for the hourly segment files (required; point it at a persistent volume) | — |
+| `retention_days` | days of history to keep; older hours are deleted | `30` |
+
+How it works — standard library only, no database:
+
+- Every observed request is appended as one JSON line to the current hour's file (`2026-09-23T14.jsonl`). Appends go through a buffered queue to a single writer goroutine, so the request path never waits on disk; if the writer ever falls behind, events are dropped and counted (dashboard + `thorngate_archive_dropped_total`) rather than slowing traffic.
+- When the hour closes, its file is **gzipped** (JSON compresses roughly 8–10×) and a small **index** is written beside it: request totals plus per-IP and per-path counts. Searching an IP reads the indexes and opens only the hours that IP appears in; top talkers and the long-range traffic chart come straight from indexes.
+- Crash-safe: sealing writes to temp files and renames them, so an interrupted seal is simply redone at the next start, and a torn final line from a crash is skipped.
+- Sizing: an event is ~200 bytes of JSON, ~25 bytes gzipped. 1M requests/day ≈ 25 MB/day on disk; typical homelab traffic stays well under a few MB for 30 days. With an archive the in-memory feed defaults to 1,000 events (it only needs the live tail).
 
 ### Admin portal (`admin`)
 
-An optional admin server on a **separate port** hosts the portal: a **React single-page app** (embedded into the binary via `go:embed`, so no CDN and no runtime dependencies) plus the JSON API it talks to. It lets you view traffic and add/remove blocked IPs live — changes hit the in-memory store and are persisted immediately, no restart. Three tabs:
+An optional admin server on a **separate port** hosts the portal: a **React single-page app** (embedded into the binary via `go:embed`, so no CDN and no runtime dependencies) plus the JSON API it talks to. Changes hit the in-memory store and are persisted immediately — no restart.
 
-- **Dashboard** — traffic stats (see `stats` above), a per-minute requests-vs-blocked chart, and a paginated feed of the last 24 hours of requests. An IP with more than 5 requests in the window gets a count badge, and each row has a **Ban** button (permanent blacklist, one click) plus a **Details** button that opens the full request (host, path, query, resolved upstream, status, bytes sent, outcome).
-- **Blacklist** — add/remove bans (single IP or CIDR).
-- **Settings** — change the admin password.
+- **Overview** — headline counters, the proxied-response status mix, a traffic chart (live per-minute for the last hour, or hourly for 24h / 7d / 30d from the archive) with hover details, and the top IPs and paths for the selected range.
+- **Requests** — the request log, searchable by **IP or CIDR range**, free text (path, host, query, user agent), outcome, status class and time range. Rows show country, a request-count badge for chatty IPs and a `banned` marker; only page 1 refreshes live, so older pages don't shift while you read.
+- **IP panel** — click any IP anywhere (or type one into the header search) for its profile: ban or whitelist status (including a covering range ban), first/last seen, outcome and status breakdowns, top paths, user agent and latest requests, with **Ban** / **Unban** / **All requests** / **Range requests** actions.
+- **Ban dialog** — ban for 1h / 24h / 7d / 30d or permanently, with a reason; for an IPv6 address it offers the whole `/64`.
+- **Blacklist** — search, filter (permanent / temporary / ranges), sort, confirmed unbans, time-to-expiry for temp bans, **export** to JSON and **import** from a thorngate export or any one-IP-per-line blocklist; plus a read-only view of the whitelist.
+- **Settings** — change the admin password, and **reload the config** live.
 
-<p align="center">
-  <img src="assets/screenshot.jpg" alt="thorngate admin dashboard" width="800">
-</p>
+| | |
+|---|---|
+| <img src="assets/screenshots/requests.png" alt="Request log" width="400"> | <img src="assets/screenshots/requests-filtered.png" alt="Requests filtered to an IPv6 /64" width="400"> |
+| **Requests** — the searchable log | Filtered to one scanner's `/64` |
+| <img src="assets/screenshots/ip-panel.png" alt="IP panel" width="400"> | <img src="assets/screenshots/ban-dialog.png" alt="Ban dialog" width="400"> |
+| **IP panel** — profile of a range-banned client | **Ban dialog** — duration, reason, whole /64 |
+| <img src="assets/screenshots/blacklist.png" alt="Blacklist tab" width="400"> | <img src="assets/screenshots/settings.png" alt="Settings tab" width="400"> |
+| **Blacklist** — filters, export / import, whitelist | **Settings** — password and live config reload |
 
 ```json
 "admin": {
   "enabled": true,
   "listen": ":9000",
   "credentials_file": "/data/admin_credentials.json",
-  "token": "optional-legacy-api-token"
+  "token": "optional-legacy-api-token",
+  "disable_metrics": false
 }
 ```
 
-- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`, relative to the working directory — **point it at a persistent volume like `/data/admin_credentials.json`** so the change survives restarts). thorngate refuses to start if this file can't be written, and a password change that can't be saved to disk fails with an error instead of silently living in memory only. Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart. Changing the password signs out every other session. After **5 consecutive failed logins**, login is refused (`429` with `Retry-After`) for 30s, doubling with each further failure up to 15 minutes; a successful login resets it. The legacy `token` keeps working during a lockout.
-- **`token`** is an **optional** legacy bearer token for scripted/API access, accepted alongside interactive login. Leave it empty (or set it via **`THORNGATE_ADMIN_TOKEN`**) to disable it and rely solely on login.
+- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`**, and until that password is changed the portal is **locked to a set-a-new-password screen** (the API answers `403` with `"must_change": true` for everything else) — new passwords need at least 8 characters and can't be the default. Credentials files written by older versions that still hold the default password are detected and locked the same way. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`, relative to the working directory — **point it at a persistent volume like `/data/admin_credentials.json`** so the change survives restarts). thorngate refuses to start if this file can't be written, and a password change that can't be saved to disk fails with an error instead of silently living in memory only. Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart. Changing the password signs out every other session. After **5 consecutive failed logins**, login is refused (`429` with `Retry-After`) for 30s, doubling with each further failure up to 15 minutes; a successful login resets it. The legacy `token` keeps working during a lockout.
+- **`token`** is an **optional** legacy bearer token for scripted/API access, accepted alongside interactive login (and not subject to the password-change lock). Leave it empty (or set it via **`THORNGATE_ADMIN_TOKEN`**) to disable it and rely solely on login.
+- **Metrics.** `GET /metrics` serves Prometheus text metrics — request/blocked/ban counters, responses by status class, bytes sent, blacklist size, tarpitted connections, archive size and drops. It is **unauthenticated** (scrapers rarely carry credentials) and exposes only counters; set `"disable_metrics": true` to turn it off.
 - **Keep this port cluster-internal — never attach it to the Cloudflare tunnel.** In k3s it's a separate ClusterIP `Service` (`thorngate-admin`); reach it with port-forward.
+
+<p align="center">
+  <img src="assets/screenshots/first-login.png" alt="First sign-in: set a new password" width="520">
+</p>
 
 ```bash
 kubectl -n thorngate port-forward svc/thorngate-admin 9000:9000
-# then open http://localhost:9000/ and sign in (default admin / admin)
+# then open http://localhost:9000/ — first sign-in is admin / admin, then set a real password
 ```
 
-API (session token from `/admin/login`, or the legacy bearer token, sent as `Authorization: Bearer <token>`):
+API (session token from `/admin/login`, or the legacy bearer token, sent as `Authorization: Bearer <token>`). Time ranges (`range=`) accept Go durations or days: `1h`, `24h`, `7d`, `30d`.
 
 | method | path | body | action |
 |--------|------|------|--------|
-| `POST` | `/admin/login` | `{"username":"...","password":"..."}` | log in → `{"token":"...","username":"..."}` |
+| `POST` | `/admin/login` | `{"username":"...","password":"..."}` | log in → `{"token":"...","username":"...","must_change":bool}` |
 | `POST` | `/admin/logout` | — | invalidate the current session |
-| `GET` | `/admin/me` | — | current username (validates the session) |
+| `GET` | `/admin/me` | — | current username + `must_change` (validates the session) |
 | `POST` | `/admin/password` | `{"current_password":"...","new_password":"..."}` | change the admin password |
-| `GET` | `/admin/blacklist` | — | list all entries (JSON) |
-| `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"..."}` | permanently ban an IP or CIDR range |
+| `GET` | `/admin/blacklist` | — | list active entries (JSON) |
+| `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"...","duration":"24h"}` | ban an IP or CIDR range; `duration` empty or `"permanent"` bans for good |
 | `DELETE` | `/admin/blacklist/{key}` | — | unban an IP or CIDR range |
-| `GET` | `/admin/stats` | — | traffic counters + per-minute series (JSON; `{"enabled":false}` if stats are off) |
-| `GET` | `/admin/stats/recent?page=1&page_size=50` | — | last 24h of requests, paginated newest-first (`page_size` max 200), with per-IP request counts for the returned page |
+| `GET` | `/admin/blacklist/export` | — | download all active entries as JSON |
+| `POST` | `/admin/blacklist/import` | JSON array (as exported) **or** plain text, one IP/CIDR per line | bulk-add bans with a single disk write → `{"added":n,"skipped":n,"invalid":[...]}` |
+| `GET` | `/admin/whitelist` | — | the current whitelist |
+| `POST` | `/admin/reload` | — | re-read the config file → `{"ok":true,"restart_required":[...]}` |
+| `GET` | `/admin/stats` | — | traffic counters + per-minute series + archive info (`{"enabled":false}` if stats are off) |
+| `GET` | `/admin/requests?ip=&q=&outcome=&status=&range=24h&page=1&page_size=50` | — | request history, newest first: `ip` is an IP or CIDR, `q` searches path/host/query/user agent, `outcome` is `proxied`/`blocked`/`honeypot`, `status` is `2xx`..`5xx`/`none`; `page_size` max 200. Includes per-IP counts and which IPs are banned. (`/admin/stats/recent` is an alias.) |
+| `GET` | `/admin/top?range=24h&n=10` | — | busiest IPs and paths |
+| `GET` | `/admin/hourly?range=7d` | — | requests / blocked per hour |
+| `GET` | `/admin/ip/{ip}?range=30d` | — | one client's profile: ban (incl. covering range), whitelisted, traffic summary |
+| `GET` | `/metrics` | — | Prometheus metrics (**no auth**; see above) |
 | `GET` | `/` (+ assets) | — | the React portal |
 
-The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range.
+The ban key may be a single IP (`1.2.3.4`) or a CIDR range (`1.2.3.0/24`, `2001:db8::/64`) — a range bans every address it contains, which is useful when an attacker rotates through a subnet. A whitelisted IP is never blocked, even if it falls inside a banned range. Addresses are normalized, so `2001:DB8::1` and `2001:db8:0::1` are the same entry.
 
 ```bash
 # Log in and reuse the session token, or set TOKEN to your legacy admin.token.
-TOKEN=$(curl -s -d '{"username":"admin","password":"admin"}' localhost:9000/admin/login | sed 's/.*"token":"\([^"]*\)".*/\1/')
+TOKEN=$(curl -s -d '{"username":"admin","password":"your-password"}' localhost:9000/admin/login | sed 's/.*"token":"\([^"]*\)".*/\1/')
 curl -H "Authorization: Bearer $TOKEN" localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.4"}' localhost:9000/admin/blacklist
-curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.0/24"}' localhost:9000/admin/blacklist
+curl -H "Authorization: Bearer $TOKEN" -d '{"ip":"1.2.3.0/24","duration":"7d"}' localhost:9000/admin/blacklist
 curl -H "Authorization: Bearer $TOKEN" -X DELETE localhost:9000/admin/blacklist/1.2.3.4
+curl -H "Authorization: Bearer $TOKEN" --data-binary @blocklist.txt localhost:9000/admin/blacklist/import
+curl -H "Authorization: Bearer $TOKEN" "localhost:9000/admin/requests?ip=2001:db8:bad:7::/64&range=7d"
+```
+
+### Reloading config
+
+Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
+
+The container image is distroless (no shell or `kill`), so in k3s reload through the admin API:
+
+```bash
+kubectl -n thorngate port-forward svc/thorngate-admin 9000:9000 &
+curl -X POST -H "Authorization: Bearer $TOKEN" localhost:9000/admin/reload
 ```
 
 #### Rebuilding the portal
@@ -340,7 +420,7 @@ Edit the image ref and your upstream service names in `deploy/k3s/thorngate.yaml
 kubectl apply -f deploy/k3s/thorngate.yaml
 ```
 
-The blacklist is stored on a `PersistentVolumeClaim` (k3s `local-path` default StorageClass). Runs as a single replica with the `Recreate` strategy because the store is in-memory + a local file. The image is multi-arch, so it runs on amd64 and arm64 (e.g. Raspberry Pi) nodes.
+The blacklist, credentials and (if enabled) the request archive are stored on a `PersistentVolumeClaim` (k3s `local-path` default StorageClass) — size it for `stats.archive` history if you enable that (the manifest requests 1Gi). Runs as a single replica with the `Recreate` strategy because the store is in-memory + a local file. The image is multi-arch, so it runs on amd64 and arm64 (e.g. Raspberry Pi) nodes.
 
 ### Point cloudflared at it
 

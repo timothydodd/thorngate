@@ -29,7 +29,8 @@ data:
         "status_codes": [401, 403, 404, 429],
         "max": 20,
         "window": "1m",
-        "ban_duration": "15m"
+        "ban_duration": "15m",
+        "escalate_after": 3
       },
       "admin": {
         "enabled": true,
@@ -38,7 +39,8 @@ data:
       },
       "stats": {
         "file": "/data/stats.json",
-        "save_interval": "1m"
+        "save_interval": "1m",
+        "archive": { "dir": "/data/requests", "retention_days": 30 }
       },
       "upstream": "10.0.0.10:8080",
       "routes": [
@@ -63,7 +65,8 @@ type: Opaque
 stringData:
   token: change-me-please
 ---
-# Persists the blacklist, admin credentials, and traffic stats across restarts.
+# Persists the blacklist, admin credentials, traffic stats and the request
+# archive (/data/requests, ~25 MB per million requests) across restarts.
 # k3s ships local-path as the default StorageClass, so this just works. RWO is
 # fine because we run a single replica.
 apiVersion: v1
@@ -75,7 +78,7 @@ spec:
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
-      storage: 64Mi
+      storage: 1Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
