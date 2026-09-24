@@ -246,3 +246,55 @@ func TestNonPositiveDurationsRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestUnknownKeysRejected(t *testing.T) {
+	for _, js := range []string{
+		`{"upstream":"10.0.0.1","tempban":{"enabled":true}}`,
+		`{"upstream":"10.0.0.1","temp_ban":{"enabled":true,"maxx":5}}`,
+		`{"upstream":"10.0.0.1","honeypots":[{"pattern":"/x","mode":"contains"}]}`,
+		`{"upstream":"10.0.0.1","whitelist":[{"ip":"1.2.3.4","nolog":true}]}`,
+	} {
+		if _, err := loadJSON(t, js); err == nil {
+			t.Errorf("config %s has an unknown key and should be rejected", js)
+		}
+	}
+}
+
+func TestNewFieldDefaults(t *testing.T) {
+	c, err := loadJSON(t, `{"upstream":"10.0.0.1","temp_ban":{"enabled":true,"escalate_after":3},
+		"stats":{"archive":{"dir":"/data/requests"}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IPv6BanPrefix != 64 || c.CountryHeader != "Cf-Ipcountry" {
+		t.Errorf("defaults: prefix=%d country=%q", c.IPv6BanPrefix, c.CountryHeader)
+	}
+	if c.TempBan.EscalateWindowDur() != 24*time.Hour {
+		t.Errorf("escalate window = %v, want 24h", c.TempBan.EscalateWindowDur())
+	}
+	if c.Stats.Archive.RetentionDays != 30 || c.Stats.RecentRequests != 1000 {
+		t.Errorf("archive defaults: retention=%d recent=%d", c.Stats.Archive.RetentionDays, c.Stats.RecentRequests)
+	}
+
+	for _, js := range []string{
+		`{"upstream":"10.0.0.1","ipv6_ban_prefix":129}`,
+		`{"upstream":"10.0.0.1","stats":{"archive":{}}}`,
+		`{"upstream":"10.0.0.1","temp_ban":{"enabled":true,"escalate_after":-1}}`,
+	} {
+		if _, err := loadJSON(t, js); err == nil {
+			t.Errorf("config %s should be rejected", js)
+		}
+	}
+}
+
+func TestReloadBlocked(t *testing.T) {
+	a, _ := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":["/a"]}`)
+	b, _ := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":["/b"],"whitelist":["1.2.3.4"]}`)
+	if got := b.ReloadBlocked(a); len(got) != 0 {
+		t.Errorf("honeypot/whitelist changes should reload live, got %v", got)
+	}
+	c, _ := loadJSON(t, `{"upstream":"10.0.0.2","listen":":1"}`)
+	if got := c.ReloadBlocked(a); len(got) != 2 {
+		t.Errorf("upstream+listen need a restart, got %v", got)
+	}
+}

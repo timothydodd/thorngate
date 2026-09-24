@@ -22,6 +22,7 @@ type Collector struct {
 	blocked   atomic.Uint64 // requests rejected by an existing blacklist entry
 	honeypots atomic.Uint64 // honeypot hits that produced a ban
 	tempBans  atomic.Uint64 // temp-bans applied for too many bad responses
+	escalated atomic.Uint64 // repeat offenders whose temp-ban was made permanent
 	s2xx      atomic.Uint64
 	s3xx      atomic.Uint64
 	s4xx      atomic.Uint64
@@ -54,6 +55,8 @@ type Event struct {
 	Deny     string    `json:"deny,omitempty"`     // how a denied request ended: "tarpit" or "drop"; empty when a 403 was written (or the request was proxied)
 	Upstream string    `json:"upstream,omitempty"` // resolved upstream URL; empty when never proxied
 	Bytes    int64     `json:"bytes"`              // response bytes sent to the client; 0 when never proxied
+	Country  string    `json:"country,omitempty"`  // client country code from the country header (e.g. Cf-Ipcountry)
+	UA       string    `json:"ua,omitempty"`       // User-Agent
 }
 
 // bucket holds one minute of the time series. min is the unix-minute the slot
@@ -70,6 +73,7 @@ type Snapshot struct {
 	Blocked   uint64    `json:"blocked"`
 	Honeypots uint64    `json:"honeypots"`
 	TempBans  uint64    `json:"temp_bans"`
+	Escalated uint64    `json:"escalated"` // temp-bans escalated to permanent
 	Status2xx uint64    `json:"status_2xx"`
 	Status3xx uint64    `json:"status_3xx"`
 	Status4xx uint64    `json:"status_4xx"`
@@ -86,6 +90,9 @@ type RecentPage struct {
 	PageSize int            `json:"page_size"` // events per page
 	Events   []Event        `json:"events"`
 	IPCounts map[string]int `json:"ip_counts"` // window-wide request count per IP appearing in Events
+	// Banned marks IPs on this page that are currently blacklisted. Filled in
+	// by the admin handler, which owns the blacklist.
+	Banned map[string]bool `json:"banned,omitempty"`
 }
 
 // Bucket is one minute of the traffic-over-time series.
@@ -140,55 +147,102 @@ func (c *Collector) recentSnapshot() []Event {
 }
 
 // Recent returns one page of the recent-requests feed, restricted to events no
-// older than maxAge (<= 0 means no age limit). page is 1-based and clamped into
-// range; pageSize <= 0 defaults to 50. IPCounts holds the window-wide request
-// count for each IP that appears on the returned page, so the UI can flag
-// chatty clients without shipping the whole window.
+// older than maxAge (<= 0 means no age limit). It is Query with only a time
+// filter; see Query for paging and IPCounts.
 func (c *Collector) Recent(maxAge time.Duration, page, pageSize int) RecentPage {
-	all := c.recentSnapshot()
+	f := Filter{}
 	if maxAge > 0 {
-		cutoff := time.Now().UTC().Add(-maxAge)
-		// The feed is newest-first, so everything after the first stale event
-		// is stale too.
-		for i, e := range all {
-			if e.Time.Before(cutoff) {
-				all = all[:i]
-				break
-			}
+		f.Since = time.Now().UTC().Add(-maxAge)
+	}
+	p, _ := c.Query(f, page, pageSize) // a time-only filter always compiles
+	return p
+}
+
+// Query returns one page of the in-memory feed's events matching f, newest
+// first. page is 1-based and clamped into range; pageSize <= 0 defaults to 50.
+// IPCounts holds, for each IP on the page, its request count across f's whole
+// time range (ignoring f's other criteria), so the UI can flag chatty clients
+// without shipping the whole window.
+func (c *Collector) Query(f Filter, page, pageSize int) (RecentPage, error) {
+	if err := f.Compile(); err != nil {
+		return RecentPage{}, err
+	}
+	all := c.recentSnapshot()
+	var matched, inWindow []Event
+	for i := range all {
+		if !f.InRange(all[i].Time) {
+			continue
+		}
+		inWindow = append(inWindow, all[i])
+		if f.Match(&all[i]) {
+			matched = append(matched, all[i])
 		}
 	}
 
-	if pageSize <= 0 {
-		pageSize = 50
-	}
-	pages := (len(all) + pageSize - 1) / pageSize
-	if page < 1 {
-		page = 1
-	}
-	if pages > 0 && page > pages {
-		page = pages
-	}
-	start := (page - 1) * pageSize
-	end := min(start+pageSize, len(all))
-	events := all[start:end]
-
+	page, pageSize, start, end := PageBounds(len(matched), page, pageSize)
+	events := matched[start:end]
 	counts := make(map[string]int, len(events))
 	for _, e := range events {
 		counts[e.IP] = 0
 	}
-	for _, e := range all {
+	for _, e := range inWindow {
 		if _, ok := counts[e.IP]; ok {
 			counts[e.IP]++
 		}
 	}
-
 	return RecentPage{
-		Total:    len(all),
+		Total:    len(matched),
 		Page:     page,
 		PageSize: pageSize,
 		Events:   events,
 		IPCounts: counts,
+	}, nil
+}
+
+// Top returns the busiest IPs and paths in the in-memory feed since the given
+// time.
+func (c *Collector) Top(since time.Time, n int) (Top, error) {
+	ips, paths := map[string]int{}, map[string]int{}
+	for _, e := range c.recentSnapshot() {
+		if e.Time.Before(since) {
+			break // newest first: the rest are older
+		}
+		ips[e.IP]++
+		paths[e.Path]++
 	}
+	return Top{IPs: TopN(ips, n), Paths: TopN(paths, n)}, nil
+}
+
+// IPSummary profiles ip's requests in the in-memory feed since the given time.
+func (c *Collector) IPSummary(ip string, since time.Time) (IPSummary, error) {
+	z := NewSummarizer(ip)
+	for _, e := range c.recentSnapshot() {
+		if e.Time.Before(since) {
+			break
+		}
+		if e.IP == ip {
+			z.Add(&e)
+		}
+	}
+	return z.Result(), nil
+}
+
+// Hourly buckets the in-memory feed by hour since the given time. It only
+// covers what the feed still holds; the archive answers longer ranges.
+func (c *Collector) Hourly(since time.Time) ([]Bucket, error) {
+	out, idx := HourlyFrame(since)
+	for _, e := range c.recentSnapshot() {
+		if e.Time.Before(since) {
+			break
+		}
+		if i, ok := idx[e.Time.UTC().Truncate(time.Hour).Unix()/60]; ok {
+			out[i].Requests++
+			if e.Outcome != "proxied" {
+				out[i].Blocked++
+			}
+		}
+	}
+	return out, nil
 }
 
 // Request records that a request was received. blocked reports whether it was
@@ -207,6 +261,9 @@ func (c *Collector) Honeypot() { c.honeypots.Add(1) }
 
 // TempBan records a temp-ban applied for too many bad responses.
 func (c *Collector) TempBan() { c.tempBans.Add(1) }
+
+// Escalated records a repeat offender's temp-ban being made permanent.
+func (c *Collector) Escalated() { c.escalated.Add(1) }
 
 // Bytes records response bytes sent to a client by a proxied request.
 func (c *Collector) Bytes(n int64) {
@@ -271,6 +328,7 @@ func (c *Collector) Snapshot() Snapshot {
 		Blocked:   c.blocked.Load(),
 		Honeypots: c.honeypots.Load(),
 		TempBans:  c.tempBans.Load(),
+		Escalated: c.escalated.Load(),
 		Status2xx: c.s2xx.Load(),
 		Status3xx: c.s3xx.Load(),
 		Status4xx: c.s4xx.Load(),
@@ -288,6 +346,7 @@ type persisted struct {
 	Blocked   uint64    `json:"blocked"`
 	Honeypots uint64    `json:"honeypots"`
 	TempBans  uint64    `json:"temp_bans"`
+	Escalated uint64    `json:"escalated"`
 	Status2xx uint64    `json:"status_2xx"`
 	Status3xx uint64    `json:"status_3xx"`
 	Status4xx uint64    `json:"status_4xx"`
@@ -313,6 +372,7 @@ func (c *Collector) Save(file string) error {
 		Blocked:   c.blocked.Load(),
 		Honeypots: c.honeypots.Load(),
 		TempBans:  c.tempBans.Load(),
+		Escalated: c.escalated.Load(),
 		Status2xx: c.s2xx.Load(),
 		Status3xx: c.s3xx.Load(),
 		Status4xx: c.s4xx.Load(),
@@ -382,6 +442,7 @@ func (c *Collector) Load(file string) error {
 	c.blocked.Store(p.Blocked)
 	c.honeypots.Store(p.Honeypots)
 	c.tempBans.Store(p.TempBans)
+	c.escalated.Store(p.Escalated)
 	c.s2xx.Store(p.Status2xx)
 	c.s3xx.Store(p.Status3xx)
 	c.s4xx.Store(p.Status4xx)

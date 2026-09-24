@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -20,6 +21,18 @@ type Config struct {
 	// ClientIPHeader is the header that holds the real external client IP.
 	// Behind a Cloudflare Tunnel this is "Cf-Connecting-Ip".
 	ClientIPHeader string `json:"client_ip_header"`
+
+	// CountryHeader holds the client's country code, recorded in the request
+	// feed. Cloudflare sets "Cf-Ipcountry" (the default) when IP geolocation is
+	// on; a missing header just leaves the country blank.
+	CountryHeader string `json:"country_header"`
+
+	// IPv6BanPrefix widens automatic bans (honeypot hits, temp-bans) of an IPv6
+	// client to its enclosing network of this prefix length. An IPv6 client
+	// typically holds a whole /64 and scanners rotate through it freely, so
+	// banning one address achieves nothing. Default 64; 128 bans the single
+	// address. IPv4 is unaffected.
+	IPv6BanPrefix int `json:"ipv6_ban_prefix"`
 
 	// BlacklistFile is where blacklisted IPs are persisted as JSON.
 	// In k8s point this at a mounted volume so it survives restarts.
@@ -109,16 +122,43 @@ type Stats struct {
 	// SaveInterval is how often the stats file is rewritten (Go duration).
 	// Default "1m". Ignored when File is empty.
 	SaveInterval string `json:"save_interval"`
+	// Archive, when set, also appends every observed request to hourly files on
+	// disk so the portal can search weeks of history instead of what fits in
+	// the in-memory feed.
+	Archive *Archive `json:"archive"`
 
 	saveInterval time.Duration
 }
+
+// Archive configures the on-disk request history.
+type Archive struct {
+	// Dir holds the hourly segment files, e.g. "/data/requests". Required.
+	Dir string `json:"dir"`
+	// RetentionDays is how many days of history to keep. Default 30.
+	RetentionDays int `json:"retention_days"`
+}
+
+// Retention returns the history retention period.
+func (a *Archive) Retention() time.Duration { return time.Duration(a.RetentionDays) * 24 * time.Hour }
 
 func (s *Stats) compile() error {
 	if s.WindowMinutes <= 0 {
 		s.WindowMinutes = 60
 	}
+	if s.Archive != nil {
+		if s.Archive.Dir == "" {
+			return fmt.Errorf("archive: dir is required")
+		}
+		if s.Archive.RetentionDays <= 0 {
+			s.Archive.RetentionDays = 30
+		}
+	}
 	if s.RecentRequests == 0 {
 		s.RecentRequests = 5000
+		if s.Archive != nil {
+			// Older history is served from disk; memory only needs the live tail.
+			s.RecentRequests = 1000
+		}
 	}
 	if s.SaveInterval == "" {
 		s.SaveInterval = "1m"
@@ -191,6 +231,9 @@ type Admin struct {
 	// THORNGATE_ADMIN_TOKEN environment variable. Leave unset to disable it and
 	// rely solely on username/password login.
 	Token string `json:"token"`
+	// DisableMetrics turns off the unauthenticated Prometheus /metrics endpoint
+	// on the admin port.
+	DisableMetrics bool `json:"disable_metrics"`
 	// CredentialsFile is where the admin username + hashed password are stored.
 	// Defaults to "admin_credentials.json". A fresh file is seeded with
 	// admin/admin; change the password from the portal's Settings tab. Point it
@@ -211,10 +254,17 @@ type TempBan struct {
 	Window string `json:"window"`
 	// BanDuration is how long the temporary ban lasts, e.g. "15m". Default "15m".
 	BanDuration string `json:"ban_duration"`
+	// EscalateAfter turns repeat offenders' temp-bans permanent: an IP (or IPv6
+	// range) temp-banned this many times within EscalateWindow is banned for
+	// good. 0 (the default) disables escalation.
+	EscalateAfter int `json:"escalate_after"`
+	// EscalateWindow is the look-back for EscalateAfter. Default "24h".
+	EscalateWindow string `json:"escalate_window"`
 
-	window time.Duration
-	banDur time.Duration
-	codes  map[int]bool
+	window   time.Duration
+	banDur   time.Duration
+	escalate time.Duration
+	codes    map[int]bool
 }
 
 func (t *TempBan) compile() error {
@@ -239,6 +289,17 @@ func (t *TempBan) compile() error {
 		return err
 	}
 	t.window, t.banDur = w, d
+	if t.EscalateAfter < 0 {
+		return fmt.Errorf("escalate_after %d: must not be negative", t.EscalateAfter)
+	}
+	if t.EscalateAfter > 0 {
+		if t.EscalateWindow == "" {
+			t.EscalateWindow = "24h"
+		}
+		if t.escalate, err = positiveDuration("escalate_window", t.EscalateWindow); err != nil {
+			return err
+		}
+	}
 	t.codes = make(map[int]bool, len(t.StatusCodes))
 	for _, c := range t.StatusCodes {
 		t.codes[c] = true
@@ -251,6 +312,9 @@ func (t *TempBan) WindowDur() time.Duration { return t.window }
 
 // BanDur returns the parsed ban duration.
 func (t *TempBan) BanDur() time.Duration { return t.banDur }
+
+// EscalateWindowDur returns the parsed escalation look-back (0 when disabled).
+func (t *TempBan) EscalateWindowDur() time.Duration { return t.escalate }
 
 // IsBadCode reports whether a response status counts toward a ban.
 func (t *TempBan) IsBadCode(code int) bool { return t.codes[code] }
@@ -289,7 +353,7 @@ func (e *WhitelistEntry) UnmarshalJSON(b []byte) error {
 	}
 	type raw WhitelistEntry // avoid recursing into this method
 	var r raw
-	if err := json.Unmarshal(b, &r); err != nil {
+	if err := strictUnmarshal(b, &r); err != nil {
 		return err
 	}
 	*e = WhitelistEntry(r)
@@ -378,7 +442,7 @@ func (h *Honeypot) UnmarshalJSON(b []byte) error {
 	}
 	type raw Honeypot // avoid recursing into this method
 	var r raw
-	if err := json.Unmarshal(b, &r); err != nil {
+	if err := strictUnmarshal(b, &r); err != nil {
 		return err
 	}
 	*h = Honeypot(r)
@@ -476,8 +540,10 @@ func Load(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
+	// Unknown keys are errors: a typo like "tempban" would otherwise silently
+	// leave a protection switched off.
 	var c Config
-	if err := json.Unmarshal(b, &c); err != nil {
+	if err := strictUnmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -486,6 +552,15 @@ func Load(filePath string) (*Config, error) {
 	}
 	if c.ClientIPHeader == "" {
 		c.ClientIPHeader = "Cf-Connecting-Ip"
+	}
+	if c.CountryHeader == "" {
+		c.CountryHeader = "Cf-Ipcountry"
+	}
+	switch {
+	case c.IPv6BanPrefix == 0:
+		c.IPv6BanPrefix = 64
+	case c.IPv6BanPrefix < 1 || c.IPv6BanPrefix > 128:
+		return nil, fmt.Errorf("config: ipv6_ban_prefix %d (want 1-128)", c.IPv6BanPrefix)
 	}
 	if c.Upstream == "" {
 		return nil, fmt.Errorf("config: a default upstream is required")
@@ -557,6 +632,38 @@ func Load(filePath string) (*Config, error) {
 	}
 
 	return &c, nil
+}
+
+// strictUnmarshal decodes JSON, rejecting unknown object keys. Custom
+// UnmarshalJSON methods receive raw bytes, so they must call this themselves
+// for the check to reach nested objects.
+func strictUnmarshal(b []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+// ReloadBlocked lists the settings that differ between c and old but only take
+// effect on restart. Everything else — honeypots, whitelist, block action,
+// tarpit, client IP / country headers, ipv6_ban_prefix — applies on reload.
+func (c *Config) ReloadBlocked(old *Config) []string {
+	var out []string
+	check := func(name string, a, b any) {
+		x, _ := json.Marshal(a)
+		y, _ := json.Marshal(b)
+		if !bytes.Equal(x, y) {
+			out = append(out, name)
+		}
+	}
+	check("listen", c.Listen, old.Listen)
+	check("blacklist_file", c.BlacklistFile, old.BlacklistFile)
+	check("upstream", c.Upstream, old.Upstream)
+	check("routes", c.Routes, old.Routes)
+	check("temp_ban", c.TempBan, old.TempBan)
+	check("request_log", c.RequestLog, old.RequestLog)
+	check("stats", c.Stats, old.Stats)
+	check("admin", c.Admin, old.Admin)
+	return out
 }
 
 // positiveDuration parses a Go duration config value that must be > 0. A zero

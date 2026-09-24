@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -259,5 +260,80 @@ func TestLoadCorruptFileErrors(t *testing.T) {
 	}
 	if err := New(60, 10).Load(file); err == nil {
 		t.Error("corrupt file should error")
+	}
+}
+
+func TestQueryFilters(t *testing.T) {
+	c := New(60, 100)
+	now := time.Now().UTC()
+	add := func(ip, path, outcome string, status int, ua string) {
+		c.Observe(Event{Time: now, IP: ip, Path: path, Outcome: outcome, Status: status, UA: ua, Host: "app.example.com"})
+	}
+	add("1.1.1.1", "/", "proxied", 200, "Mozilla")
+	add("1.1.1.2", "/.env", "honeypot", 0, "curl/8")
+	add("2001:db8::1", "/login", "proxied", 401, "python-requests")
+	add("1.1.1.1", "/about", "proxied", 200, "Mozilla")
+
+	cases := []struct {
+		f    Filter
+		want int
+	}{
+		{Filter{}, 4},
+		{Filter{IP: "1.1.1.1"}, 2},
+		{Filter{IP: "1.1.1.0/24"}, 3},
+		{Filter{IP: "2001:DB8::1"}, 1},
+		{Filter{Outcome: "honeypot"}, 1},
+		{Filter{Status: "4xx"}, 1},
+		{Filter{Status: "none"}, 1},
+		{Filter{Text: "CURL"}, 1},
+		{Filter{Text: "about"}, 1},
+		{Filter{IP: "1.1.1.1", Text: "about"}, 1},
+		{Filter{Since: now.Add(time.Minute)}, 0},
+	}
+	for _, tc := range cases {
+		p, err := c.Query(tc.f, 1, 50)
+		if err != nil {
+			t.Fatalf("%+v: %v", tc.f, err)
+		}
+		if p.Total != tc.want {
+			t.Errorf("%+v: total = %d, want %d", tc.f, p.Total, tc.want)
+		}
+	}
+	p, _ := c.Query(Filter{Text: "about"}, 1, 50)
+	if p.IPCounts["1.1.1.1"] != 2 {
+		t.Errorf("IPCounts should count the IP's whole window, got %d", p.IPCounts["1.1.1.1"])
+	}
+	for _, bad := range []Filter{{IP: "nope"}, {Outcome: "x"}, {Status: "6xx"}} {
+		if _, err := c.Query(bad, 1, 50); err == nil {
+			t.Errorf("%+v should be rejected", bad)
+		}
+	}
+}
+
+func TestTopSummaryHourly(t *testing.T) {
+	c := New(60, 100)
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		c.Observe(Event{Time: now.Add(time.Duration(i-3) * time.Second), IP: "9.9.9.9", Path: "/.env", Outcome: "blocked", Country: "NL", UA: fmt.Sprint("ua", i)})
+	}
+	c.Observe(Event{Time: now, IP: "8.8.8.8", Path: "/", Outcome: "proxied", Status: 200})
+
+	top, _ := c.Top(now.Add(-time.Hour), 5)
+	if len(top.IPs) != 2 || top.IPs[0].Key != "9.9.9.9" || top.IPs[0].Count != 3 {
+		t.Errorf("top IPs = %+v", top.IPs)
+	}
+	s, _ := c.IPSummary("9.9.9.9", now.Add(-time.Hour))
+	if s.Requests != 3 || s.Outcomes["blocked"] != 3 || s.Country != "NL" || s.UA != "ua2" {
+		t.Errorf("summary = %+v", s)
+	}
+	if s.FirstSeen == nil || s.LastSeen == nil || !s.FirstSeen.Before(*s.LastSeen) {
+		t.Errorf("first/last seen wrong: %v %v", s.FirstSeen, s.LastSeen)
+	}
+	h, _ := c.Hourly(now.Add(-2 * time.Hour))
+	if len(h) != 3 {
+		t.Fatalf("hourly buckets = %d, want 3", len(h))
+	}
+	if last := h[len(h)-1]; last.Requests+h[len(h)-2].Requests != 4 {
+		t.Errorf("hourly totals wrong: %+v", h)
 	}
 }
