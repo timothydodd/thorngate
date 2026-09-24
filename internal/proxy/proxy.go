@@ -7,7 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,7 +33,9 @@ type WAF struct {
 	stats     *stats.Collector       // nil unless stats is enabled
 	noLog     []*net.IPNet           // whitelist entries flagged no_log: skip stats/history
 
-	tarpitting atomic.Int64 // connections currently held by the tarpit
+	tarpitting atomic.Int64  // connections currently held by the tarpit
+	stop       chan struct{} // closed by ReleaseTarpits at shutdown
+	stopOnce   sync.Once
 }
 
 type hostRoute struct {
@@ -42,16 +46,17 @@ type hostRoute struct {
 
 // New builds the WAF handler from config and a blacklist store.
 func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
-	w := &WAF{cfg: cfg, bl: bl, noLog: blacklist.ParseNets(cfg.NoLogSpecs())}
+	w := &WAF{cfg: cfg, bl: bl, noLog: blacklist.ParseNets(cfg.NoLogSpecs()), stop: make(chan struct{})}
 
-	def, defTarget, err := newProxy(cfg.Upstream)
+	tr := newTransport()
+	def, defTarget, err := newProxy(cfg.Upstream, tr)
 	if err != nil {
 		return nil, err
 	}
 	w.def, w.defTarget = def, defTarget
 
 	for _, r := range cfg.Routes {
-		rp, target, err := newProxy(r.Upstream)
+		rp, target, err := newProxy(r.Upstream, tr)
 		if err != nil {
 			return nil, err
 		}
@@ -89,15 +94,34 @@ func New(cfg *config.Config, bl *blacklist.Blacklist) (*WAF, error) {
 // portal reads it to render the dashboard.
 func (w *WAF) Stats() *stats.Collector { return w.stats }
 
+// ReleaseTarpits ends every tarpit hold (current and future) immediately. It is
+// registered with http.Server.RegisterOnShutdown so held connections — up to
+// tarpit_duration each — don't outlast the graceful-shutdown timeout.
+func (w *WAF) ReleaseTarpits() {
+	w.stopOnce.Do(func() { close(w.stop) })
+}
+
+// newTransport returns the upstream transport shared by every proxy. Unlike
+// http.DefaultTransport (2 idle connections per host), it keeps enough idle
+// connections that proxied requests under load reuse them instead of opening a
+// fresh upstream connection each time.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = 512
+	t.MaxIdleConnsPerHost = 128
+	return t
+}
+
 // newProxy builds a single-host reverse proxy for an upstream config value. It
 // also returns the resolved target URL so requests can be logged with the
 // upstream they were routed to.
-func newProxy(upstream string) (*httputil.ReverseProxy, string, error) {
+func newProxy(upstream string, tr http.RoundTripper) (*httputil.ReverseProxy, string, error) {
 	target, err := config.ParseUpstream(upstream)
 	if err != nil {
 		return nil, "", err
 	}
 	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.Transport = tr
 	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("upstream error host=%s path=%s upstream=%s: %v", req.Host, req.URL.Path, target, err)
 		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
@@ -251,29 +275,56 @@ func (w *WAF) monitorResponse(ip string, status int) {
 
 // clientIP returns the real external IP. Behind a Cloudflare Tunnel this comes
 // from the configured header (Cf-Connecting-Ip); otherwise it falls back to the
-// TCP peer address.
+// TCP peer address. Addresses are canonicalized ("2001:DB8::1" ->
+// "2001:db8::1") so each client maps to exactly one blacklist key. A header
+// value that isn't an IP is returned as-is rather than falling back to the
+// peer, which is cloudflared itself and must never be banned.
 func (w *WAF) clientIP(r *http.Request) string {
 	if h := r.Header.Get(w.cfg.ClientIPHeader); h != "" {
 		// Header may be a single IP (CF) or a comma list (XFF).
 		if i := strings.IndexByte(h, ','); i >= 0 {
 			h = h[:i]
 		}
-		return strings.TrimSpace(h)
+		return canonicalIP(strings.TrimSpace(h))
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return canonicalIP(r.RemoteAddr)
 	}
-	return host
+	return canonicalIP(host)
 }
 
-func (w *WAF) honeypot(reqPath string) (string, bool) {
-	for i := range w.cfg.Honeypots {
-		if w.cfg.Honeypots[i].Matches(reqPath) {
-			return w.cfg.Honeypots[i].Pattern, true
-		}
+func canonicalIP(s string) string {
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
 	}
-	return "", false
+	return s
+}
+
+// honeypot checks the request path against the honeypots. The cleaned path is
+// checked too: "/x/../wp-admin", "//wp-admin" and (on IIS) "/x\..\wp-admin"
+// all reach the upstream's /wp-admin though the raw path doesn't start with it.
+func (w *WAF) honeypot(reqPath string) (string, bool) {
+	if clean := cleanPath(reqPath); clean != reqPath {
+		return w.cfg.Honeypots.Match(reqPath, clean)
+	}
+	return w.cfg.Honeypots.Match(reqPath)
+}
+
+// cleanPath resolves "." / ".." / duplicate slashes (and backslashes, which IIS
+// treats as separators) the way an upstream would, keeping a trailing slash.
+func cleanPath(p string) string {
+	if strings.IndexByte(p, '\\') >= 0 {
+		p = strings.ReplaceAll(p, "\\", "/")
+	}
+	if p == "" || p[0] != '/' {
+		p = "/" + p
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c
 }
 
 // denyAction decides how a blocked request will be ended — "forbidden",
@@ -307,6 +358,7 @@ func (w *WAF) deny(action string, rw http.ResponseWriter, r *http.Request) {
 		t := time.NewTimer(w.cfg.TarpitDur())
 		select {
 		case <-r.Context().Done(): // client hung up first
+		case <-w.stop: // server shutting down
 		case <-t.C:
 		}
 		t.Stop()

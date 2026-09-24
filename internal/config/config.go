@@ -27,7 +27,7 @@ type Config struct {
 
 	// Honeypots are patterns that should never be hit by a legitimate client.
 	// Any external IP that matches one is blacklisted immediately.
-	Honeypots []Honeypot `json:"honeypots"`
+	Honeypots Honeypots `json:"honeypots"`
 
 	// BlockAction is what a blocked client (blacklisted IP or honeypot hit)
 	// receives. "tarpit" (default) never responds at all: the connection is
@@ -167,9 +167,9 @@ func (r *RequestLog) compile() error {
 	if r.TTL == "" {
 		r.TTL = "15m"
 	}
-	d, err := time.ParseDuration(r.TTL)
+	d, err := positiveDuration("ttl", r.TTL)
 	if err != nil {
-		return fmt.Errorf("ttl %q: %w", r.TTL, err)
+		return err
 	}
 	r.ttl = d
 	return nil
@@ -230,13 +230,13 @@ func (t *TempBan) compile() error {
 	if t.BanDuration == "" {
 		t.BanDuration = "15m"
 	}
-	w, err := time.ParseDuration(t.Window)
+	w, err := positiveDuration("window", t.Window)
 	if err != nil {
-		return fmt.Errorf("window %q: %w", t.Window, err)
+		return err
 	}
-	d, err := time.ParseDuration(t.BanDuration)
+	d, err := positiveDuration("ban_duration", t.BanDuration)
 	if err != nil {
-		return fmt.Errorf("ban_duration %q: %w", t.BanDuration, err)
+		return err
 	}
 	t.window, t.banDur = w, d
 	t.codes = make(map[int]bool, len(t.StatusCodes))
@@ -328,11 +328,44 @@ func (c *Config) NoLogSpecs() []string {
 //
 // Supported match modes: "prefix" (default), "contains", "suffix",
 // "glob" (path.Match against the full path), "regex".
+//
+// Matching ignores case unless CaseSensitive is set: probes like "/WP-Admin"
+// reach case-insensitive upstreams (IIS/ASP.NET) just like "/wp-admin" does.
 type Honeypot struct {
-	Pattern string `json:"pattern"`
-	Match   string `json:"match"`
+	Pattern       string `json:"pattern"`
+	Match         string `json:"match"`
+	CaseSensitive bool   `json:"case_sensitive"`
 
-	re *regexp.Regexp // compiled, for match == "regex"
+	fold string         // Pattern, lowercased unless CaseSensitive
+	re   *regexp.Regexp // compiled, for match == "regex"
+}
+
+// Honeypots is the configured honeypot list.
+type Honeypots []Honeypot
+
+// Match returns the pattern of the first honeypot tripped by any of the given
+// forms of the request path (e.g. raw and cleaned). Each path is lowercased at
+// most once, not once per honeypot.
+func (hs Honeypots) Match(paths ...string) (string, bool) {
+	var lower []string
+	for i := range hs {
+		h := &hs[i]
+		for j, p := range paths {
+			if !h.CaseSensitive {
+				if lower == nil {
+					lower = make([]string, len(paths))
+					for k := range paths {
+						lower[k] = strings.ToLower(paths[k])
+					}
+				}
+				p = lower[j]
+			}
+			if h.matchFolded(p) {
+				return h.Pattern, true
+			}
+		}
+	}
+	return "", false
 }
 
 // UnmarshalJSON lets a honeypot be a bare string (prefix) or a full object.
@@ -356,6 +389,10 @@ func (h *Honeypot) UnmarshalJSON(b []byte) error {
 }
 
 func (h *Honeypot) compile() error {
+	// Checked before prefix normalization, which would turn "" into "/".
+	if h.Pattern == "" {
+		return fmt.Errorf("honeypot pattern is empty")
+	}
 	switch h.Match {
 	case "prefix":
 		if !strings.HasPrefix(h.Pattern, "/") {
@@ -368,7 +405,11 @@ func (h *Honeypot) compile() error {
 			return fmt.Errorf("invalid glob %q: %w", h.Pattern, err)
 		}
 	case "regex":
-		re, err := regexp.Compile(h.Pattern)
+		expr := h.Pattern
+		if !h.CaseSensitive {
+			expr = "(?i)" + expr
+		}
+		re, err := regexp.Compile(expr)
 		if err != nil {
 			return fmt.Errorf("invalid regex %q: %w", h.Pattern, err)
 		}
@@ -376,23 +417,38 @@ func (h *Honeypot) compile() error {
 	default:
 		return fmt.Errorf("unknown match mode %q (want prefix|contains|suffix|glob|regex)", h.Match)
 	}
-	if h.Pattern == "" {
-		return fmt.Errorf("honeypot pattern is empty")
+	h.fold = h.Pattern
+	if !h.CaseSensitive {
+		h.fold = strings.ToLower(h.Pattern)
+	}
+	// The site root is always legitimate traffic. A honeypot that matches it
+	// ("/" as a prefix, "/" as contains/suffix, ".*" as a regex, ...) would
+	// permanently ban every visitor on their first request.
+	if h.Matches("/") {
+		return fmt.Errorf("pattern %q matches the site root \"/\" and would ban every visitor", h.Pattern)
 	}
 	return nil
 }
 
 // Matches reports whether a request path trips this honeypot.
 func (h *Honeypot) Matches(reqPath string) bool {
+	if !h.CaseSensitive {
+		reqPath = strings.ToLower(reqPath)
+	}
+	return h.matchFolded(reqPath)
+}
+
+// matchFolded matches a path already lowercased when the honeypot ignores case.
+func (h *Honeypot) matchFolded(reqPath string) bool {
 	switch h.Match {
 	case "prefix":
-		return prefixMatch(reqPath, h.Pattern)
+		return prefixMatch(reqPath, h.fold)
 	case "contains":
-		return strings.Contains(reqPath, h.Pattern)
+		return strings.Contains(reqPath, h.fold)
 	case "suffix":
-		return strings.HasSuffix(reqPath, h.Pattern)
+		return strings.HasSuffix(reqPath, h.fold)
 	case "glob":
-		ok, _ := path.Match(h.Pattern, reqPath)
+		ok, _ := path.Match(h.fold, reqPath)
 		return ok
 	case "regex":
 		return h.re.MatchString(reqPath)
@@ -501,6 +557,20 @@ func Load(filePath string) (*Config, error) {
 	}
 
 	return &c, nil
+}
+
+// positiveDuration parses a Go duration config value that must be > 0. A zero
+// or negative period would, among other things, hand time.Tick a nil channel
+// and silently stop the periodic sweep that bounds memory.
+func positiveDuration(field, v string) (time.Duration, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q: %w", field, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s %q: must be positive", field, v)
+	}
+	return d, nil
 }
 
 // ParseUpstream turns a config upstream value into a URL the proxy can use.

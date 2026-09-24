@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDefaultLogin(t *testing.T) {
@@ -50,13 +51,13 @@ func TestLogout(t *testing.T) {
 
 func TestChangePassword(t *testing.T) {
 	s, _ := New("")
-	if err := s.ChangePassword("wrong", "newsecret"); err != ErrBadCredentials {
+	if err := s.ChangePassword("wrong", "newsecret", ""); err != ErrBadCredentials {
 		t.Errorf("wrong current: got %v, want ErrBadCredentials", err)
 	}
-	if err := s.ChangePassword(DefaultPassword, "no"); err != ErrWeakPassword {
+	if err := s.ChangePassword(DefaultPassword, "no", ""); err != ErrWeakPassword {
 		t.Errorf("weak new: got %v, want ErrWeakPassword", err)
 	}
-	if err := s.ChangePassword(DefaultPassword, "newsecret"); err != nil {
+	if err := s.ChangePassword(DefaultPassword, "newsecret", ""); err != nil {
 		t.Fatalf("change: %v", err)
 	}
 	if _, err := s.Login(DefaultUsername, DefaultPassword); err != ErrBadCredentials {
@@ -90,7 +91,7 @@ func TestChangePasswordRollsBackWhenPersistFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.ChangePassword(DefaultPassword, "newsecret"); err == nil {
+	if err := s.ChangePassword(DefaultPassword, "newsecret", ""); err == nil {
 		t.Fatal("ChangePassword should error when the file can't be written")
 	}
 	// The failed change must roll back: the old password still works.
@@ -108,7 +109,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := s1.ChangePassword(DefaultPassword, "persisted"); err != nil {
+	if err := s1.ChangePassword(DefaultPassword, "persisted", ""); err != nil {
 		t.Fatalf("change: %v", err)
 	}
 	// Reload from disk — the changed password must survive.
@@ -118,5 +119,77 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 	if _, err := s2.Login(DefaultUsername, "persisted"); err != nil {
 		t.Errorf("persisted password should work after reload: %v", err)
+	}
+}
+
+func TestLockoutAfterRepeatedFailures(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < lockoutThreshold; i++ {
+		if _, err := s.Login(DefaultUsername, "wrong"); err != ErrBadCredentials {
+			t.Fatalf("attempt %d: err = %v, want ErrBadCredentials", i+1, err)
+		}
+	}
+	if d := s.LockedFor(); d <= 0 || d > lockoutBase {
+		t.Fatalf("LockedFor = %v, want (0, %v]", d, lockoutBase)
+	}
+	// Even the right password is refused while locked out.
+	if _, err := s.Login(DefaultUsername, DefaultPassword); err != ErrLockedOut {
+		t.Fatalf("err = %v, want ErrLockedOut", err)
+	}
+
+	// Once the lockout lapses, a successful login resets the counter.
+	s.mu.Lock()
+	s.lockedUntil = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	if _, err := s.Login(DefaultUsername, DefaultPassword); err != nil {
+		t.Fatalf("login after lockout: %v", err)
+	}
+	if _, err := s.Login(DefaultUsername, "wrong"); err != ErrBadCredentials {
+		t.Fatalf("err = %v, want ErrBadCredentials", err)
+	}
+	if s.LockedFor() != 0 {
+		t.Fatal("one failure after a success should not lock out")
+	}
+}
+
+func TestLockoutDoublesAndCaps(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.failures = lockoutThreshold // next failure is one over the threshold
+	s.failLocked()
+	got := time.Until(s.lockedUntil)
+	s.failures = 1000
+	s.failLocked()
+	capped := time.Until(s.lockedUntil)
+	s.mu.Unlock()
+	if got <= lockoutBase || got > 2*lockoutBase {
+		t.Errorf("second lockout = %v, want ~%v", got, 2*lockoutBase)
+	}
+	if capped > lockoutMax {
+		t.Errorf("lockout = %v, want capped at %v", capped, lockoutMax)
+	}
+}
+
+func TestChangePasswordRevokesOtherSessions(t *testing.T) {
+	s, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, _ := s.Login(DefaultUsername, DefaultPassword)
+	other, _ := s.Login(DefaultUsername, DefaultPassword)
+	if err := s.ChangePassword(DefaultPassword, "newsecret", mine); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Valid(mine) {
+		t.Error("the caller's own session should survive a password change")
+	}
+	if s.Valid(other) {
+		t.Error("other sessions should be revoked by a password change")
 	}
 }

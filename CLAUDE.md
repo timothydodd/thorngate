@@ -45,6 +45,6 @@ The whole request lifecycle lives in `internal/proxy/proxy.go` (`WAF.ServeHTTP`)
 - **Zero-overhead-when-off**: temp-ban and request-log features wrap the response (`statusWriter`) only when enabled — `ServeHTTP` proxies directly otherwise. Preserve this fast path when adding response-inspecting features.
 - **`statusWriter`** wraps `http.ResponseWriter` to capture the status code; it must forward `Flush` (streaming) and `Hijack` (WebSocket/SignalR protocol upgrades — hijacked connections record a `101`). Adding a new response feature usually means touching this wrapper.
 - `/healthz` is reserved (registered separately in `main.go`) — never proxied, never honeypot-able.
-- Mutating-store methods (`Add`/`Remove`) snapshot under lock then `persist` outside it. Follow that pattern to avoid holding the lock during disk I/O.
+- Mutating-store methods (`Add`/`Remove`/`Sweep`) snapshot under lock via `changedLocked()` (which bumps a generation counter) then `persist` outside it. `persist` serializes writes and skips snapshots older than one already on disk — concurrent writers share one `.tmp` file, so never write it without that guard. Follow that pattern to avoid holding the lock during disk I/O.
 
 The README is thorough and user-facing — consult it for config-field semantics and deployment (k3s manifests in `deploy/k3s/`, cloudflared ingress). When you change behavior of a config field, honeypot match mode, or the admin API, update the README too.

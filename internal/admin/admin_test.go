@@ -151,3 +151,51 @@ func TestLoginFlow(t *testing.T) {
 		t.Errorf("post-logout: got %d, want 401", r.StatusCode)
 	}
 }
+
+func TestLoginLockoutReturns429(t *testing.T) {
+	srv, _ := newServer(t)
+	defer srv.Close()
+
+	for i := 0; i < 5; i++ {
+		do(t, srv, "POST", "/admin/login", `{"username":"admin","password":"nope"}`, "")
+	}
+	res := do(t, srv, "POST", "/admin/login", `{"username":"admin","password":"admin"}`, "")
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("locked-out login: got %d, want 429", res.StatusCode)
+	}
+	if res.Header.Get("Retry-After") == "" {
+		t.Error("429 should carry a Retry-After header")
+	}
+	// The legacy API token is unaffected by the login lockout.
+	if r := do(t, srv, "GET", "/admin/blacklist", "", token); r.StatusCode != http.StatusOK {
+		t.Errorf("token auth during lockout: got %d, want 200", r.StatusCode)
+	}
+}
+
+func TestOversizedBodyRejected(t *testing.T) {
+	srv, _ := newServer(t)
+	defer srv.Close()
+
+	body := `{"ip":"1.2.3.4","reason":"` + strings.Repeat("x", 100<<10) + `"}`
+	if res := do(t, srv, "POST", "/admin/blacklist", body, token); res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized body: got %d, want 400", res.StatusCode)
+	}
+}
+
+func TestBanKeysNormalized(t *testing.T) {
+	srv, bl := newServer(t)
+	defer srv.Close()
+
+	do(t, srv, "POST", "/admin/blacklist", `{"ip":" 2001:DB8::1 "}`, token)
+	if !bl.IsBlocked("2001:db8::1") {
+		t.Fatal("admin ban should be stored under the canonical address")
+	}
+	res := do(t, srv, "DELETE", "/admin/blacklist/2001:0DB8::0001", "", token)
+	var out struct {
+		Removed bool `json:"removed"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	if !out.Removed {
+		t.Fatal("unban should accept any spelling of the address")
+	}
+}

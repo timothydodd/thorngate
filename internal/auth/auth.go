@@ -10,6 +10,7 @@
 package auth
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -33,6 +34,14 @@ const (
 	sessionTTL     = 12 * time.Hour
 	MinPasswordLen = 4
 
+	// Brute-force throttling: after lockoutThreshold consecutive failed logins,
+	// login is refused for lockoutBase, doubling with each further failure up to
+	// lockoutMax. A successful login resets it. The lockout is global (there is
+	// one account); the legacy API token keeps working while it is in effect.
+	lockoutThreshold = 5
+	lockoutBase      = 30 * time.Second
+	lockoutMax       = 15 * time.Minute
+
 	// DefaultUsername / DefaultPassword seed a fresh install so the operator can
 	// log in immediately, then change the password from the Settings tab.
 	DefaultUsername = "admin"
@@ -44,6 +53,7 @@ var (
 	ErrBadCredentials = errors.New("invalid username or password")
 	ErrWeakPassword   = errors.New("new password too short")
 	ErrInvalidToken   = errors.New("invalid or expired session")
+	ErrLockedOut      = errors.New("too many failed logins; try again later")
 )
 
 // creds is the on-disk representation. Salt and Hash are base64.
@@ -64,6 +74,9 @@ type Store struct {
 	hash     []byte
 	iter     int
 	sessions map[string]time.Time // token -> expiry
+
+	failures    int       // consecutive failed logins
+	lockedUntil time.Time // logins refused until then
 }
 
 // New loads credentials from file, seeding admin/admin (and persisting them if
@@ -109,17 +122,32 @@ func New(file string) (*Store, error) {
 }
 
 // setPassword derives and stores a fresh salt+hash for the given credentials.
-// The caller holds no lock on first use (New); ChangePassword holds s.mu.
+// Only used by New, before the store is shared.
 func (s *Store) setPassword(username, password string) error {
-	salt := make([]byte, saltLen)
-	if _, err := rand.Read(salt); err != nil {
+	salt, h, err := deriveNew(password)
+	if err != nil {
 		return err
 	}
-	s.username = username
-	s.salt = salt
-	s.iter = pbkdf2Iter
-	s.hash = pbkdf2Key([]byte(password), salt, s.iter, keyLen, sha256.New)
+	s.username, s.salt, s.hash, s.iter = username, salt, h, pbkdf2Iter
 	return nil
+}
+
+// deriveNew hashes password with a fresh random salt at the current iteration
+// count. It takes no lock: the KDF is deliberately slow.
+func deriveNew(password string) (salt, h []byte, err error) {
+	salt = make([]byte, saltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, nil, err
+	}
+	return salt, pbkdf2Key([]byte(password), salt, pbkdf2Iter, keyLen, sha256.New), nil
+}
+
+// current returns the stored credentials so the slow KDF can run outside s.mu
+// (holding it would stall every session check behind a burst of logins).
+func (s *Store) current() (username string, salt, h []byte, iter int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.username, s.salt, s.hash, s.iter
 }
 
 // Username returns the current admin username.
@@ -131,17 +159,27 @@ func (s *Store) Username() string {
 
 // Login verifies credentials and, on success, returns a new session token.
 // Both the username and password are always compared (constant time) so timing
-// does not reveal which half was wrong.
+// does not reveal which half was wrong. Repeated failures trigger a lockout
+// (see lockoutThreshold), during which it returns ErrLockedOut.
 func (s *Store) Login(username, password string) (string, error) {
+	if s.LockedFor() > 0 {
+		return "", ErrLockedOut
+	}
+	user, salt, h, iter := s.current()
+	derived := pbkdf2Key([]byte(password), salt, iter, keyLen, sha256.New)
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(user)) == 1
+	passOK := subtle.ConstantTimeCompare(derived, h) == 1
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	derived := pbkdf2Key([]byte(password), s.salt, s.iter, keyLen, sha256.New)
-	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(s.username)) == 1
-	passOK := subtle.ConstantTimeCompare(derived, s.hash) == 1
+	if !bytes.Equal(h, s.hash) {
+		return "", ErrBadCredentials // password changed while we were hashing
+	}
 	if !userOK || !passOK {
+		s.failLocked()
 		return "", ErrBadCredentials
 	}
+	s.failures, s.lockedUntil = 0, time.Time{}
 
 	s.sweepLocked()
 	token, err := newToken()
@@ -171,6 +209,28 @@ func (s *Store) Valid(token string) bool {
 	return true
 }
 
+// LockedFor reports how long logins remain locked out (0 when they aren't).
+func (s *Store) LockedFor() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(time.Until(s.lockedUntil), 0)
+}
+
+// failLocked counts a failed login and starts or extends the lockout once the
+// threshold is reached. Caller holds s.mu.
+func (s *Store) failLocked() {
+	s.failures++
+	over := s.failures - lockoutThreshold
+	if over < 0 {
+		return
+	}
+	d := lockoutMax
+	if over < 10 { // beyond this the doubling is past lockoutMax anyway
+		d = min(lockoutBase<<over, lockoutMax)
+	}
+	s.lockedUntil = time.Now().Add(d)
+}
+
 // Logout invalidates a session token.
 func (s *Store) Logout(token string) {
 	s.mu.Lock()
@@ -178,28 +238,40 @@ func (s *Store) Logout(token string) {
 	delete(s.sessions, token)
 }
 
-// ChangePassword verifies the current password, then replaces it. All existing
-// sessions except the caller's stay valid; callers may keep using their token.
-// If the new credentials cannot be persisted, the change is rolled back and an
-// error returned — otherwise the "new" password would silently die on restart.
-func (s *Store) ChangePassword(current, next string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	derived := pbkdf2Key([]byte(current), s.salt, s.iter, keyLen, sha256.New)
-	if subtle.ConstantTimeCompare(derived, s.hash) != 1 {
+// ChangePassword verifies the current password, then replaces it and revokes
+// every session except keepToken (the caller's own, so they stay signed in) —
+// anyone who knew the old password may be holding one. If the new credentials
+// cannot be persisted, the change is rolled back and an error returned —
+// otherwise the "new" password would silently die on restart.
+func (s *Store) ChangePassword(current, next, keepToken string) error {
+	_, salt, h, iter := s.current()
+	derived := pbkdf2Key([]byte(current), salt, iter, keyLen, sha256.New)
+	if subtle.ConstantTimeCompare(derived, h) != 1 {
 		return ErrBadCredentials
 	}
 	if len(next) < MinPasswordLen {
 		return ErrWeakPassword
 	}
-	oldSalt, oldHash, oldIter := s.salt, s.hash, s.iter
-	if err := s.setPassword(s.username, next); err != nil {
+	newSalt, newHash, err := deriveNew(next)
+	if err != nil {
 		return err
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !bytes.Equal(h, s.hash) {
+		return ErrBadCredentials // changed concurrently; current is stale
+	}
+	oldSalt, oldHash, oldIter := s.salt, s.hash, s.iter
+	s.salt, s.hash, s.iter = newSalt, newHash, pbkdf2Iter
 	if err := s.persist(); err != nil {
 		s.salt, s.hash, s.iter = oldSalt, oldHash, oldIter
 		return err
+	}
+	for tok := range s.sessions {
+		if tok != keepToken {
+			delete(s.sessions, tok)
+		}
 	}
 	return nil
 }

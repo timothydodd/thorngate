@@ -2,6 +2,7 @@ package blacklist
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -43,8 +44,13 @@ type Blacklist struct {
 	cidrs   []cidrEntry
 	file    string
 
-	// whitelist holds parsed CIDRs / single IPs that are never blocked.
+	// whitelist holds parsed CIDRs / single IPs that are never blocked. It is
+	// fixed after New, so it is read without the lock.
 	whitelist []*net.IPNet
+
+	gen       uint64     // bumped on every mutation (guarded by mu)
+	persistMu sync.Mutex // serializes disk writes
+	savedGen  uint64     // generation last written to disk (guarded by persistMu)
 }
 
 // isCIDR reports whether a ban key denotes a CIDR range rather than a single IP.
@@ -119,10 +125,15 @@ func wildcardToCIDR(s string) (string, bool) {
 // free function so callers (e.g. the proxy's no-log set) can reuse ParseNets
 // without a Blacklist instance.
 func Matches(nets []*net.IPNet, ip string) bool {
-	parsed := net.ParseIP(ip)
+	parsed := net.ParseIP(strings.TrimSpace(ip))
 	if parsed == nil {
 		return false
 	}
+	return containsIP(nets, parsed)
+}
+
+// containsIP is Matches for an already-parsed address.
+func containsIP(nets []*net.IPNet, parsed net.IP) bool {
 	for _, n := range nets {
 		if n.Contains(parsed) {
 			return true
@@ -131,63 +142,95 @@ func Matches(nets []*net.IPNet, ip string) bool {
 	return false
 }
 
+// NormalizeKey canonicalizes a ban key so one address always maps to one entry:
+// "2001:DB8::1" -> "2001:db8::1", "::ffff:1.2.3.4" -> "1.2.3.4", and
+// "1.2.3.4/24" -> "1.2.3.0/24". Unparseable keys are only trimmed.
+func NormalizeKey(key string) string {
+	key = strings.TrimSpace(key)
+	if isCIDR(key) {
+		if _, ipnet, err := net.ParseCIDR(key); err == nil {
+			return ipnet.String()
+		}
+		return key
+	}
+	if ip := net.ParseIP(key); ip != nil {
+		return ip.String()
+	}
+	return key
+}
+
 // New creates a Blacklist, loading any previously persisted entries from file.
-// whitelist accepts plain IPs ("1.2.3.4") or CIDRs ("10.0.0.0/8").
+// whitelist accepts plain IPs ("1.2.3.4") or CIDRs ("10.0.0.0/8"). A corrupt
+// file is moved aside (never silently overwritten) and loading starts empty.
 func New(file string, whitelist []string) (*Blacklist, error) {
 	b := &Blacklist{
-		entries: make(map[string]Entry),
-		file:    file,
+		entries:   make(map[string]Entry),
+		file:      file,
+		whitelist: ParseNets(whitelist),
+	}
+	if file == "" {
+		return b, nil
 	}
 
-	b.whitelist = ParseNets(whitelist)
-
-	if file != "" {
-		if data, err := os.ReadFile(file); err == nil {
-			var list []Entry
-			if json.Unmarshal(data, &list) == nil {
-				for _, e := range list {
-					if e.expired() {
-						continue // drop bans that lapsed while we were down
-					}
-					if _, ipnet, err := net.ParseCIDR(e.IP); err == nil {
-						b.cidrs = append(b.cidrs, cidrEntry{net: ipnet, entry: e})
-					} else {
-						b.entries[e.IP] = e
-					}
-				}
-			}
-		} else if !os.IsNotExist(err) {
-			return nil, err
+	data, err := os.ReadFile(file)
+	if os.IsNotExist(err) {
+		return b, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var list []Entry
+	if err := json.Unmarshal(data, &list); err != nil {
+		// Starting empty and carrying on would let the next ban overwrite the
+		// file, losing every stored ban for good. Set it aside for inspection.
+		bad := fmt.Sprintf("%s.corrupt-%s", file, time.Now().UTC().Format("20060102T150405Z"))
+		if rerr := os.Rename(file, bad); rerr != nil {
+			return nil, fmt.Errorf("blacklist file %s is corrupt (%v) and could not be moved aside: %w", file, err, rerr)
+		}
+		log.Printf("blacklist: WARNING %s is corrupt (%v); moved it to %s and starting with an empty blacklist", file, err, bad)
+		return b, nil
+	}
+	for _, e := range list {
+		if e.expired() {
+			continue // drop bans that lapsed while we were down
+		}
+		e.IP = NormalizeKey(e.IP)
+		if _, ipnet, err := net.ParseCIDR(e.IP); err == nil {
+			b.cidrs = append(b.cidrs, cidrEntry{net: ipnet, entry: e})
+		} else {
+			b.entries[e.IP] = e
 		}
 	}
-
 	return b, nil
 }
 
 // IsBlocked reports whether an IP is currently blacklisted, either by an exact
 // match or because it falls within a blacklisted CIDR range. Expired exact bans
 // are removed lazily on lookup; a whitelisted IP is never reported as blocked,
-// even if it sits inside a banned range.
+// even if it has an exact ban (e.g. one made before it was whitelisted) or sits
+// inside a banned range.
 func (b *Blacklist) IsBlocked(ip string) bool {
-	b.mu.RLock()
-	e, ok := b.entries[ip]
-	b.mu.RUnlock()
-	if ok {
-		if e.expired() {
-			b.Remove(ip)
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	key := ip
+	if parsed != nil {
+		key = parsed.String()
+		if containsIP(b.whitelist, parsed) {
 			return false
 		}
-		return true
 	}
 
 	b.mu.RLock()
+	e, ok := b.entries[key]
 	hasCIDRs := len(b.cidrs) > 0
 	b.mu.RUnlock()
-	if !hasCIDRs {
-		return false
+	if ok {
+		if !e.expired() {
+			return true
+		}
+		b.removeExpired(key) // then fall through: a CIDR ban may still cover it
 	}
-	parsed := net.ParseIP(ip)
-	if parsed == nil || b.IsWhitelisted(ip) {
+
+	if !hasCIDRs || parsed == nil {
 		return false
 	}
 	b.mu.RLock()
@@ -200,11 +243,66 @@ func (b *Blacklist) IsBlocked(ip string) bool {
 	return false
 }
 
-// List returns a snapshot of all current entries.
+// removeExpired deletes ip's exact entry only if it is still expired once the
+// write lock is held — a concurrent Add may have replaced it with a fresh or
+// permanent ban since the caller looked.
+func (b *Blacklist) removeExpired(ip string) {
+	b.mu.Lock()
+	e, ok := b.entries[ip]
+	if !ok || !e.expired() {
+		b.mu.Unlock()
+		return
+	}
+	delete(b.entries, ip)
+	snap := b.changedLocked()
+	b.mu.Unlock()
+	b.persist(snap)
+}
+
+// Sweep drops every expired ban (exact IPs and CIDR ranges) and persists the
+// result if anything changed, returning how many were dropped. IsBlocked already
+// ignores expired bans; sweeping keeps them out of List and the file for IPs
+// that never come back. Call periodically.
+func (b *Blacklist) Sweep() int {
+	b.mu.Lock()
+	n := 0
+	for ip, e := range b.entries {
+		if e.expired() {
+			delete(b.entries, ip)
+			n++
+		}
+	}
+	kept := b.cidrs[:0]
+	for _, c := range b.cidrs {
+		if c.entry.expired() {
+			n++
+			continue
+		}
+		kept = append(kept, c)
+	}
+	b.cidrs = kept
+	if n == 0 {
+		b.mu.Unlock()
+		return 0
+	}
+	snap := b.changedLocked()
+	b.mu.Unlock()
+	b.persist(snap)
+	return n
+}
+
+// List returns a snapshot of all current (unexpired) entries.
 func (b *Blacklist) List() []Entry {
 	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.snapshotLocked()
+	all := b.snapshotLocked()
+	b.mu.RUnlock()
+	live := all[:0]
+	for _, e := range all {
+		if !e.expired() {
+			live = append(live, e)
+		}
+	}
+	return live
 }
 
 // IsWhitelisted reports whether an IP should never be blacklisted.
@@ -226,6 +324,7 @@ func (b *Blacklist) AddTemp(ip, reason string, dur time.Duration) bool {
 }
 
 func (b *Blacklist) add(ip, reason, path string, until time.Time) bool {
+	ip = NormalizeKey(ip)
 	if isCIDR(ip) {
 		return b.addCIDR(ip, reason, path, until)
 	}
@@ -253,17 +352,17 @@ func (b *Blacklist) add(ip, reason, path string, until time.Time) bool {
 			}
 			b.entries[ip] = Entry{IP: ip, Reason: existing.Reason, Path: existing.Path,
 				Timestamp: existing.Timestamp, Until: until}
-			snapshot := b.snapshotLocked()
+			snap := b.changedLocked()
 			b.mu.Unlock()
-			b.persist(snapshot)
+			b.persist(snap)
 			return false // already blocked; don't re-log
 		}
 	}
 	b.entries[ip] = Entry{IP: ip, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}
-	snapshot := b.snapshotLocked()
+	snap := b.changedLocked()
 	b.mu.Unlock()
 
-	b.persist(snapshot)
+	b.persist(snap)
 	return true
 }
 
@@ -301,44 +400,45 @@ func (b *Blacklist) addCIDR(cidr, reason, path string, until time.Time) bool {
 				}
 				b.cidrs[i].entry = Entry{IP: existing.IP, Reason: existing.Reason, Path: existing.Path,
 					Timestamp: existing.Timestamp, Until: until}
-				snapshot := b.snapshotLocked()
+				snap := b.changedLocked()
 				b.mu.Unlock()
-				b.persist(snapshot)
+				b.persist(snap)
 				return false // already blocked; don't re-log
 			}
 		}
-		b.cidrs[i].entry = Entry{IP: cidr, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}
-		snapshot := b.snapshotLocked()
+		b.cidrs[i].entry = Entry{IP: key, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}
+		snap := b.changedLocked()
 		b.mu.Unlock()
-		b.persist(snapshot)
+		b.persist(snap)
 		return true
 	}
 	b.cidrs = append(b.cidrs, cidrEntry{net: ipnet,
-		entry: Entry{IP: cidr, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}})
-	snapshot := b.snapshotLocked()
+		entry: Entry{IP: key, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}})
+	snap := b.changedLocked()
 	b.mu.Unlock()
-	b.persist(snapshot)
+	b.persist(snap)
 	return true
 }
 
 // Remove deletes an IP or CIDR range from the blacklist and persists the change.
-// A CIDR may be passed either as originally stored or in normalized form.
-// Returns true if an entry was present.
+// Keys are normalized first, so a CIDR may be passed as originally entered or in
+// normalized form. Returns true if an entry was present.
 func (b *Blacklist) Remove(ip string) bool {
+	ip = NormalizeKey(ip)
 	b.mu.Lock()
 	if _, ok := b.entries[ip]; ok {
 		delete(b.entries, ip)
-		snapshot := b.snapshotLocked()
+		snap := b.changedLocked()
 		b.mu.Unlock()
-		b.persist(snapshot)
+		b.persist(snap)
 		return true
 	}
 	for i := range b.cidrs {
 		if b.cidrs[i].entry.IP == ip || b.cidrs[i].net.String() == ip {
 			b.cidrs = append(b.cidrs[:i], b.cidrs[i+1:]...)
-			snapshot := b.snapshotLocked()
+			snap := b.changedLocked()
 			b.mu.Unlock()
-			b.persist(snapshot)
+			b.persist(snap)
 			return true
 		}
 	}
@@ -364,15 +464,36 @@ func (b *Blacklist) snapshotLocked() []Entry {
 	return list
 }
 
+// pendingWrite is a copy of the set taken right after a mutation, tagged with a
+// generation so persist can tell which of two racing writes is newer.
+type pendingWrite struct {
+	list []Entry
+	gen  uint64
+}
+
+// changedLocked records a mutation and returns the state to persist. Caller
+// holds b.mu for writing.
+func (b *Blacklist) changedLocked() pendingWrite {
+	b.gen++
+	return pendingWrite{list: b.snapshotLocked(), gen: b.gen}
+}
+
 // persist atomically writes the blacklist to disk: write to a temp file, fsync
-// it so the data is durable, then rename over the target. Unlike a fire-and-
-// forget write, every failure is logged so a broken persistence path (read-only
-// mount, full disk) is visible rather than silently dropping bans on restart.
-func (b *Blacklist) persist(list []Entry) {
+// it so the data is durable, then rename over the target. Writes are serialized
+// (they share one temp file) and a snapshot older than one already on disk is
+// skipped, so concurrent bans can neither corrupt the file nor roll it back.
+// Every failure is logged so a broken persistence path (read-only mount, full
+// disk) is visible rather than silently dropping bans on restart.
+func (b *Blacklist) persist(w pendingWrite) {
 	if b.file == "" {
 		return
 	}
-	data, err := json.MarshalIndent(list, "", "  ")
+	b.persistMu.Lock()
+	defer b.persistMu.Unlock()
+	if w.gen <= b.savedGen {
+		return // a newer snapshot already reached disk
+	}
+	data, err := json.MarshalIndent(w.list, "", "  ")
 	if err != nil {
 		log.Printf("blacklist: marshal failed: %v", err)
 		return
@@ -399,5 +520,7 @@ func (b *Blacklist) persist(list []Entry) {
 	}
 	if err := os.Rename(tmp, b.file); err != nil {
 		log.Printf("blacklist: rename %s -> %s failed: %v", tmp, b.file, err)
+		return
 	}
+	b.savedGen = w.gen
 }

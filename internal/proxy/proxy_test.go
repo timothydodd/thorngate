@@ -236,3 +236,62 @@ func TestTarpitMaxFallsBackToDrop(t *testing.T) {
 		t.Fatalf("over-cap request held for %v, want an immediate drop", held)
 	}
 }
+
+func TestHoneypotMatchesUncleanAndMixedCasePaths(t *testing.T) {
+	for _, p := range []string{"//wp-admin", "/x/../wp-admin/", "/x/%5C..%5Cwp-admin", "/WP-Admin/setup.php"} {
+		t.Run(p, func(t *testing.T) {
+			var hits int32
+			w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"],"block_action":"forbidden"`)
+			w.ServeHTTP(httptest.NewRecorder(), reqFrom("7.7.7.7", p))
+			if !bl.IsBlocked("7.7.7.7") {
+				t.Fatalf("%q reaches the upstream's /wp-admin and should trip the honeypot", p)
+			}
+			if hits != 0 {
+				t.Fatalf("honeypot request must not reach upstream (hits = %d)", hits)
+			}
+		})
+	}
+}
+
+func TestClientIPIsCanonicalized(t *testing.T) {
+	var hits int32
+	w, bl := newWAF(t, okBackend(&hits), `,"honeypots":["/wp-admin"],"block_action":"forbidden"`)
+	w.ServeHTTP(httptest.NewRecorder(), reqFrom("2001:DB8:0::1", "/wp-admin"))
+	if !bl.IsBlocked("2001:db8::1") {
+		t.Fatal("the ban should be keyed by the canonical IPv6 form")
+	}
+}
+
+func TestReleaseTarpitsEndsHolds(t *testing.T) {
+	var hits int32
+	extra := `,"honeypots":["/wp-admin"],"block_action":"tarpit","tarpit_duration":"10s"`
+	w, _ := newWAF(t, okBackend(&hits), extra)
+	srv := httptest.NewServer(w)
+	t.Cleanup(srv.Close)
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/wp-admin", nil)
+		req.Header.Set("Cf-Connecting-Ip", "4.4.4.4")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+		done <- time.Since(start)
+	}()
+	for i := 0; w.tarpitting.Load() == 0; i++ {
+		if i > 100 {
+			t.Fatal("request never entered the tarpit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	w.ReleaseTarpits()
+	select {
+	case held := <-done:
+		if held > 5*time.Second {
+			t.Fatalf("tarpit held %v after release", held)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReleaseTarpits did not end the held connection")
+	}
+}

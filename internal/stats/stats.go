@@ -37,6 +37,8 @@ type Collector struct {
 	recent    []Event // ring buffer of the most recent observed requests
 	recentPos int     // index of the next write
 	recentLen int     // number of valid entries (grows to len(recent))
+
+	saveMu sync.Mutex // serializes Save: concurrent saves share one temp file
 }
 
 // Event is one observed request kept in the recent-requests feed.
@@ -298,11 +300,14 @@ type persisted struct {
 
 // Save atomically writes the collector's full state to file (temp file + fsync
 // + rename, the same pattern the blacklist uses). Safe to call concurrently
-// with request traffic.
+// with request traffic and with other Saves (e.g. the periodic save racing the
+// final one at shutdown).
 func (c *Collector) Save(file string) error {
 	if file == "" {
 		return nil
 	}
+	c.saveMu.Lock()
+	defer c.saveMu.Unlock()
 	p := persisted{
 		Requests:  c.requests.Load(),
 		Blocked:   c.blocked.Load(),

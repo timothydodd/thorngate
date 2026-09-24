@@ -187,3 +187,62 @@ func TestBlockAction(t *testing.T) {
 		t.Error("non-positive tarpit_duration should be rejected")
 	}
 }
+
+func TestHoneypotsThatMatchRootAreRejected(t *testing.T) {
+	for _, hp := range []string{
+		`""`,
+		`"/"`,
+		`{"pattern":"", "match":"contains"}`,
+		`{"pattern":"/", "match":"contains"}`,
+		`{"pattern":"/", "match":"suffix"}`,
+		`{"pattern":"/*", "match":"glob"}`,
+		`{"pattern":".*", "match":"regex"}`,
+	} {
+		if _, err := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":[`+hp+`]}`); err == nil {
+			t.Errorf("honeypot %s would ban every visitor and should be rejected", hp)
+		}
+	}
+}
+
+func TestHoneypotsIgnoreCaseByDefault(t *testing.T) {
+	c, err := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":[
+		"/wp-admin",
+		{"pattern":".ENV","match":"suffix"},
+		{"pattern":"\\.git(/|$)","match":"regex"},
+		{"pattern":"/Secret","match":"prefix","case_sensitive":true}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/WP-Admin/setup.php", true},
+		{"/app/.env", true},
+		{"/.GIT/config", true},
+		{"/Secret/x", true},
+		{"/secret/x", false}, // case_sensitive honeypot
+		{"/index.html", false},
+	}
+	for _, c2 := range cases {
+		if _, got := c.Honeypots.Match(c2.path); got != c2.want {
+			t.Errorf("Match(%q) = %v, want %v", c2.path, got, c2.want)
+		}
+	}
+	if p, ok := c.Honeypots.Match("/ok", "/WP-ADMIN"); !ok || p != "/wp-admin" {
+		t.Errorf("Match should check every path form, got %q %v", p, ok)
+	}
+}
+
+func TestNonPositiveDurationsRejected(t *testing.T) {
+	for _, js := range []string{
+		`{"upstream":"10.0.0.1","temp_ban":{"enabled":true,"window":"0s"}}`,
+		`{"upstream":"10.0.0.1","temp_ban":{"enabled":true,"ban_duration":"-1m"}}`,
+		`{"upstream":"10.0.0.1","request_log":{"ttl":"0s"}}`,
+	} {
+		if _, err := loadJSON(t, js); err == nil {
+			t.Errorf("config %s should be rejected", js)
+		}
+	}
+}

@@ -8,6 +8,8 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -74,6 +76,19 @@ func bearer(r *http.Request) string {
 	return ""
 }
 
+// maxBodyBytes caps JSON request bodies; every admin payload is tiny.
+const maxBodyBytes = 64 << 10
+
+// decodeJSON reads a size-capped JSON body into v, writing a 400 on failure.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return false
+	}
+	return true
+}
+
 // authed wraps a handler with session (or legacy API token) authentication.
 func (s *server) authed(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -92,11 +107,17 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 	token, err := s.au.Login(strings.TrimSpace(body.Username), body.Password)
+	if errors.Is(err, auth.ErrLockedOut) {
+		wait := s.au.LockedFor()
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{
+			"error": fmt.Sprintf("too many failed logins; try again in %s", wait.Round(time.Second))})
+		return
+	}
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
@@ -118,11 +139,10 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		Current string `json:"current_password"`
 		New     string `json:"new_password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	switch err := s.au.ChangePassword(body.Current, body.New); err {
+	switch err := s.au.ChangePassword(body.Current, body.New, bearer(r)); err {
 	case nil:
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case auth.ErrBadCredentials:
@@ -177,11 +197,10 @@ func (s *server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
 		IP     string `json:"ip"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	ip := strings.TrimSpace(body.IP)
+	ip := blacklist.NormalizeKey(body.IP)
 	if !validBanKey(ip) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid IP address or CIDR range"})
 		return
@@ -199,7 +218,7 @@ func (s *server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleRemoveBlacklist(w http.ResponseWriter, r *http.Request) {
-	ip := r.PathValue("key")
+	ip := blacklist.NormalizeKey(r.PathValue("key"))
 	removed := s.bl.Remove(ip)
 	writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "removed": removed})
 }

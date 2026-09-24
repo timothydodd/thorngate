@@ -54,19 +54,37 @@ func main() {
 		}()
 	}
 
-	mux := http.NewServeMux()
-	// Liveness/readiness probe — not proxied, not honeypot-able.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+	// Drop expired temp-bans for IPs that never come back, so they don't linger
+	// in the file or the admin list.
+	go func() {
+		for range time.Tick(time.Minute) {
+			if n := bl.Sweep(); n > 0 {
+				log.Printf("blacklist: swept %d expired ban(s)", n)
+			}
+		}
+	}()
+
+	// Not an http.ServeMux: it answers unclean paths ("//x", "/a/../x") with a
+	// 301 before any handler runs, so a blacklisted client would get a response
+	// instead of being denied.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Liveness/readiness probe — not proxied, not honeypot-able.
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		waf.ServeHTTP(w, r)
 	})
-	mux.Handle("/", waf)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	// Tarpitted connections are held for up to tarpit_duration; let them go as
+	// soon as shutdown starts so they don't outlast its timeout.
+	srv.RegisterOnShutdown(waf.ReleaseTarpits)
 
 	go func() {
 		log.Printf("thorngate listening on %s (blacklisted=%d, routes=%d)",

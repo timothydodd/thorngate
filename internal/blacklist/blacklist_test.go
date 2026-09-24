@@ -1,7 +1,12 @@
 package blacklist
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -221,5 +226,134 @@ func TestPersistAndReload(t *testing.T) {
 	}
 	if bl2.IsBlocked("6.6.6.6") {
 		t.Fatal("a temp ban that lapsed while down must be dropped on reload")
+	}
+}
+
+func TestConcurrentAddsPersistEverything(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "bl.json")
+	bl, err := New(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 300
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			bl.Add(fmt.Sprintf("10.0.%d.%d", i/250, i%250), "honeypot", "/x")
+		}(i)
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list []Entry
+	if err := json.Unmarshal(data, &list); err != nil {
+		t.Fatalf("concurrent bans corrupted the file: %v", err)
+	}
+	if len(list) != n {
+		t.Fatalf("file holds %d bans, want %d (a stale snapshot overwrote a newer one)", len(list), n)
+	}
+}
+
+func TestCorruptFileIsMovedAsideNotOverwritten(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "bl.json")
+	if err := os.WriteFile(file, []byte(`[{"ip":"1.2.3.4"}{"ip":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bl, err := New(file, nil)
+	if err != nil {
+		t.Fatalf("a corrupt file should not stop startup: %v", err)
+	}
+	if bl.Count() != 0 {
+		t.Fatalf("Count = %d, want 0", bl.Count())
+	}
+	matches, _ := filepath.Glob(file + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("corrupt file should be set aside, found %v", matches)
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatal("corrupt file should have been moved, not left in place")
+	}
+}
+
+func TestWhitelistOverridesExistingExactBan(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "bl.json")
+	bl1, err := New(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bl1.Add("1.2.3.4", "manual", "")
+
+	// Restart with the IP now whitelisted in config.
+	bl2, err := New(file, []string{"1.2.3.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bl2.IsBlocked("1.2.3.4") {
+		t.Fatal("a whitelisted IP must not be blocked by a ban made before it was whitelisted")
+	}
+}
+
+func TestKeysAreNormalized(t *testing.T) {
+	bl := newBL(t, nil)
+	bl.Add("2001:DB8:0::1", "manual", "")
+	if !bl.IsBlocked("2001:db8::1") {
+		t.Fatal("IPv6 ban should match regardless of case / zero compression")
+	}
+	bl.Add("::ffff:9.9.9.9", "manual", "")
+	if !bl.IsBlocked("9.9.9.9") {
+		t.Fatal("IPv4-mapped IPv6 ban should match the plain IPv4 address")
+	}
+	if !bl.Remove("2001:0db8::0001") {
+		t.Fatal("Remove should accept any spelling of the address")
+	}
+	bl.Add("1.2.3.4/24", "manual", "")
+	for _, e := range bl.List() {
+		if strings.Contains(e.IP, "/") && e.IP != "1.2.3.0/24" {
+			t.Fatalf("CIDR stored as %q, want normalized 1.2.3.0/24", e.IP)
+		}
+	}
+}
+
+func TestSweepDropsExpiredBans(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "bl.json")
+	bl, err := New(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bl.AddTemp("5.5.5.5", "rate-limit", 10*time.Millisecond)
+	bl.Add("6.6.6.6", "honeypot", "/x")
+	time.Sleep(30 * time.Millisecond)
+
+	if got := len(bl.List()); got != 1 {
+		t.Fatalf("List should hide expired bans, got %d entries", got)
+	}
+	if n := bl.Sweep(); n != 1 {
+		t.Fatalf("Sweep dropped %d, want 1", n)
+	}
+	if bl.Count() != 1 {
+		t.Fatalf("Count after sweep = %d, want 1", bl.Count())
+	}
+	reloaded, err := New(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Count() != 1 || !reloaded.IsBlocked("6.6.6.6") {
+		t.Fatal("sweep result should be persisted with the permanent ban intact")
+	}
+}
+
+func TestExpiredExactBanStillCoveredByCIDR(t *testing.T) {
+	bl := newBL(t, nil)
+	bl.Add("7.7.7.0/24", "manual", "")
+	bl.AddTemp("7.7.7.7", "rate-limit", 10*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	if !bl.IsBlocked("7.7.7.7") {
+		t.Fatal("an expired exact ban must not hide a covering CIDR ban")
 	}
 }

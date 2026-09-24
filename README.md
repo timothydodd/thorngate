@@ -68,7 +68,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 
 ### Whitelist (`whitelist`)
 
-IPs listed here are **never** blacklisted — not by a honeypot hit, not by a temp-ban, and not even if they fall inside a banned CIDR range. Whitelist your own admin IP and internal ranges so you can't lock yourself out.
+IPs listed here are **never** blacklisted — not by a honeypot hit, not by a temp-ban, and not even if they fall inside a banned CIDR range. Whitelisting an IP that is *already* banned lifts the ban too (after a restart to pick up the config change). Whitelist your own admin IP and internal ranges so you can't lock yourself out.
 
 Each entry is either a **bare string** or an **object**. The address may be a single IP, a CIDR, or an octet wildcard:
 
@@ -107,6 +107,10 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 | `suffix` | path ends with pattern |
 | `glob` | `path.Match` against the full path (`*` does **not** cross `/` — use `contains`/`suffix` for "anywhere") |
 | `regex` | Go `regexp` against the full path |
+
+- Matching is **case-insensitive** by default, since case-insensitive upstreams (IIS/ASP.NET) serve `/WP-Admin` just like `/wp-admin`. Add `"case_sensitive": true` to an object-form honeypot to opt out.
+- Paths are checked both as sent and **cleaned** (`//wp-admin`, `/x/../wp-admin` and `/x\..\wp-admin` all count as `/wp-admin`), since that is what an upstream would serve.
+- A honeypot that matches the site root `/` (e.g. `""`, `"/"`, `{"pattern": ".*", "match": "regex"}`) is rejected at startup — it would ban every visitor on their first request.
 
 ### Block action (`block_action`)
 
@@ -172,7 +176,8 @@ Honeypots are an *instant, permanent* ban. `temp_ban` is the softer, optional la
 | `window` | sliding counting window (Go duration) | `"1m"` |
 | `ban_duration` | how long the temporary ban lasts (Go duration) | `"15m"` |
 
-- Bans **auto-expire** after `ban_duration` (lazily removed on the next request, and dropped on restart if already lapsed).
+- Bans **auto-expire** after `ban_duration` (removed on the IP's next request or by a once-a-minute sweep, and dropped on restart if already lapsed).
+- `window` and `ban_duration` must be positive durations; config loading fails otherwise.
 - Whitelisted IPs are never temp-banned; a honeypot (permanent) ban always outranks a temporary one.
 - Omit the whole `temp_ban` block to disable it (zero overhead — responses aren't even wrapped).
 
@@ -257,7 +262,7 @@ An optional admin server on a **separate port** hosts the portal: a **React sing
 }
 ```
 
-- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`, relative to the working directory — **point it at a persistent volume like `/data/admin_credentials.json`** so the change survives restarts). thorngate refuses to start if this file can't be written, and a password change that can't be saved to disk fails with an error instead of silently living in memory only. Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart.
+- **Login.** The portal authenticates with a username + password. A fresh install seeds **`admin` / `admin`** — sign in and change the password from the **Settings** tab immediately. The username and a salted **PBKDF2-HMAC-SHA256** hash of the password are stored in `credentials_file` (default `admin_credentials.json`, relative to the working directory — **point it at a persistent volume like `/data/admin_credentials.json`** so the change survives restarts). thorngate refuses to start if this file can't be written, and a password change that can't be saved to disk fails with an error instead of silently living in memory only. Sessions are opaque tokens held in memory with a sliding 12-hour TTL; they do not survive a restart. Changing the password signs out every other session. After **5 consecutive failed logins**, login is refused (`429` with `Retry-After`) for 30s, doubling with each further failure up to 15 minutes; a successful login resets it. The legacy `token` keeps working during a lockout.
 - **`token`** is an **optional** legacy bearer token for scripted/API access, accepted alongside interactive login. Leave it empty (or set it via **`THORNGATE_ADMIN_TOKEN`**) to disable it and rely solely on login.
 - **Keep this port cluster-internal — never attach it to the Cloudflare tunnel.** In k3s it's a separate ClusterIP `Service` (`thorngate-admin`); reach it with port-forward.
 
