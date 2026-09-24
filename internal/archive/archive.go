@@ -106,6 +106,9 @@ func (a *Archive) Append(e stats.Event) {
 	}
 }
 
+// Retention returns how long history is kept.
+func (a *Archive) Retention() time.Duration { return a.retention }
+
 // Dropped returns how many events were discarded because the queue was full.
 func (a *Archive) Dropped() uint64 { return a.dropped.Load() }
 

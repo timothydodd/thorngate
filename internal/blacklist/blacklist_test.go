@@ -450,3 +450,31 @@ func TestPermanentEntryOmitsUntilInJSON(t *testing.T) {
 		t.Fatalf("round trip lost until: %+v %v", back, err)
 	}
 }
+
+func TestAddManyWritesOnce(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "bl.json")
+	bl, err := New(file, []string{"9.9.9.9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bl.Add("1.1.1.1", "manual", "")
+	n := bl.AddMany([]Entry{
+		{IP: "1.1.1.1", Reason: "dup"},                     // already permanent
+		{IP: "2.2.2.2", Reason: "import"},                  // new
+		{IP: "3.3.3.0/24", Reason: "import"},               // new range
+		{IP: "4.4.4.4", Until: time.Now().Add(time.Hour)},  // new temp
+		{IP: "5.5.5.5", Until: time.Now().Add(-time.Hour)}, // already expired
+		{IP: "9.9.9.9", Reason: "import"},                  // whitelisted
+		{IP: "not-an-ip/99", Reason: "import"},             // unparseable range
+	})
+	if n != 3 {
+		t.Fatalf("AddMany added %d, want 3", n)
+	}
+	reloaded, err := New(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Count() != 4 || !reloaded.IsBlocked("3.3.3.7") || !reloaded.IsBlocked("4.4.4.4") {
+		t.Fatalf("persisted set wrong: %v", reloaded.List())
+	}
+}

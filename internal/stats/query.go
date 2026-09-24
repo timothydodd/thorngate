@@ -173,8 +173,8 @@ type IPSummary struct {
 	Hosts     []Counted      `json:"hosts"`    // top hosts
 	FirstSeen *time.Time     `json:"first_seen,omitempty"`
 	LastSeen  *time.Time     `json:"last_seen,omitempty"`
-	Country   string         `json:"country,omitempty"` // from the most recent request
-	UA        string         `json:"ua,omitempty"`      // from the most recent request
+	Country   string         `json:"country,omitempty"` // most recent non-empty value
+	UA        string         `json:"ua,omitempty"`      // most recent non-empty value
 }
 
 // Summarizer accumulates an IPSummary from events fed newest first.
@@ -197,7 +197,15 @@ func (z *Summarizer) Add(e *Event) {
 	s := &z.s
 	if s.Requests == 0 {
 		t := e.Time
-		s.LastSeen, s.Country, s.UA = &t, e.Country, e.UA
+		s.LastSeen = &t
+	}
+	// Newest non-empty values: one request without the header shouldn't
+	// blank what the others reported.
+	if s.Country == "" {
+		s.Country = e.Country
+	}
+	if s.UA == "" {
+		s.UA = e.UA
 	}
 	t := e.Time
 	s.FirstSeen = &t

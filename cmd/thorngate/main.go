@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"thorngate/internal/admin"
+	"thorngate/internal/archive"
 	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
@@ -53,6 +56,51 @@ func main() {
 			}
 		}()
 	}
+
+	// Optional on-disk request history, for searching well past what the
+	// in-memory feed holds.
+	var arch *archive.Archive
+	if waf.Stats() != nil && cfg.Stats.Archive != nil {
+		a := cfg.Stats.Archive
+		if arch, err = archive.Open(a.Dir, a.Retention()); err != nil {
+			log.Fatalf("archive: %v", err)
+		}
+		waf.SetArchive(arch)
+		log.Printf("archive: request history in %s, kept %d days", a.Dir, a.RetentionDays)
+	}
+
+	// Live config reload (SIGHUP or the admin portal). Settings that need a
+	// restart are compared against the config the process started with, so
+	// they keep being reported until it restarts.
+	var (
+		cfgMu   sync.Mutex
+		current = cfg
+	)
+	reload := func() ([]string, error) {
+		cfgMu.Lock()
+		defer cfgMu.Unlock()
+		next, err := config.Load(*configPath)
+		if err != nil {
+			return nil, err
+		}
+		waf.Reload(next)
+		current = next
+		restart := next.ReloadBlocked(cfg)
+		log.Printf("config reloaded (honeypots=%d, whitelist=%d)", len(next.Honeypots), len(next.Whitelist))
+		if len(restart) > 0 {
+			log.Printf("config: changes to %s take effect on restart", strings.Join(restart, ", "))
+		}
+		return restart, nil
+	}
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if _, err := reload(); err != nil {
+				log.Printf("config: reload failed, keeping the running config: %v", err)
+			}
+		}
+	}()
 
 	// Drop expired temp-bans for IPs that never come back, so they don't linger
 	// in the file or the admin list.
@@ -102,8 +150,22 @@ func main() {
 			log.Fatalf("admin credentials: %v", err)
 		}
 		adminSrv = &http.Server{
-			Addr:              cfg.Admin.Listen,
-			Handler:           admin.Handler(bl, waf.Stats(), au, cfg.Admin.Token),
+			Addr: cfg.Admin.Listen,
+			Handler: admin.Handler(admin.Options{
+				Blacklist: bl,
+				Stats:     waf.Stats(),
+				Archive:   arch,
+				Auth:      au,
+				APIToken:  cfg.Admin.Token,
+				Whitelist: func() []config.WhitelistEntry {
+					cfgMu.Lock()
+					defer cfgMu.Unlock()
+					return current.Whitelist
+				},
+				Reload:     reload,
+				Tarpitting: waf.Tarpitting,
+				Metrics:    !cfg.Admin.DisableMetrics,
+			}),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {
@@ -131,5 +193,8 @@ func main() {
 		if err := waf.Stats().Save(statsFile); err != nil {
 			log.Printf("stats: final save %s: %v", statsFile, err)
 		}
+	}
+	if arch != nil {
+		arch.Close()
 	}
 }

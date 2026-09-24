@@ -408,52 +408,83 @@ func (b *Blacklist) AddTemp(ip, reason string, dur time.Duration) bool {
 	return b.add(ip, reason, "", time.Now().UTC().Add(dur))
 }
 
-// add applies a ban with temp/permanent reconciliation: a permanent ban
-// outranks (and upgrades) a temporary one, and re-banning an active temporary
-// entry only ever extends it.
+// add applies one ban and persists it if anything changed.
 func (b *Blacklist) add(ip, reason, path string, until time.Time) bool {
+	b.mu.Lock()
+	added, changed := b.addLocked(ip, reason, path, until)
+	if !changed {
+		b.mu.Unlock()
+		return added
+	}
+	snap := b.changedLocked()
+	b.mu.Unlock()
+	b.persist(snap)
+	return added
+}
+
+// AddMany applies a batch of bans (e.g. an import) with a single write to
+// disk, returning how many became new or upgraded bans. Each entry's Until
+// decides permanent (zero) or temporary; entries already expired are skipped.
+// Keys are normalized and whitelisted IPs skipped, as with Add.
+func (b *Blacklist) AddMany(entries []Entry) int {
+	n, changed := 0, false
+	b.mu.Lock()
+	for _, e := range entries {
+		if e.expired() {
+			continue
+		}
+		added, ch := b.addLocked(e.IP, e.Reason, e.Path, e.Until)
+		if added {
+			n++
+		}
+		changed = changed || ch
+	}
+	if !changed {
+		b.mu.Unlock()
+		return n
+	}
+	snap := b.changedLocked()
+	b.mu.Unlock()
+	b.persist(snap)
+	return n
+}
+
+// addLocked applies a ban with temp/permanent reconciliation: a permanent ban
+// outranks (and upgrades) a temporary one, and re-banning an active temporary
+// entry only ever extends it. added reports a new or upgraded ban (worth
+// logging); changed reports whether the set needs persisting. Caller holds
+// b.mu for writing.
+func (b *Blacklist) addLocked(ip, reason, path string, until time.Time) (added, changed bool) {
 	key := NormalizeKey(ip)
 	if !isCIDR(key) && b.IsWhitelisted(key) {
-		return false
+		return false, false
 	}
-
-	b.mu.Lock()
 	m := b.bucketLocked(key, true)
 	if m == nil {
-		b.mu.Unlock()
-		return false // unparseable CIDR
+		return false, false // unparseable CIDR
 	}
 	existing, exists := m[key]
 	if exists && !existing.expired() {
 		permanentReq := until.IsZero()
 		switch {
 		case permanentReq && existing.Until.IsZero():
-			b.mu.Unlock()
-			return false // already permanent, nothing to do
+			return false, false // already permanent, nothing to do
 		case permanentReq:
 			// Upgrade an active temporary ban to permanent.
 		case existing.Until.IsZero():
-			b.mu.Unlock()
-			return false // permanent ban outranks a temporary one
+			return false, false // permanent ban outranks a temporary one
 		default:
 			// Refresh an existing temporary ban, extend if later.
-			if until.Before(existing.Until) {
-				until = existing.Until
+			if !until.After(existing.Until) {
+				return false, false
 			}
 			existing.Until = until
 			m[key] = existing
-			snap := b.changedLocked()
-			b.mu.Unlock()
-			b.persist(snap)
-			return false // already blocked; don't re-log
+			return false, true // already blocked; don't re-log
 		}
 	}
 	m[key] = Entry{IP: key, Reason: reason, Path: path, Timestamp: time.Now().UTC(), Until: until}
-	snap := b.changedLocked()
-	b.mu.Unlock()
-
-	b.persist(snap)
-	return true
+	return true, true
 }
 
 // Remove deletes an IP or CIDR range from the blacklist and persists the change.

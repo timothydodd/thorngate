@@ -193,3 +193,50 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 		t.Error("other sessions should be revoked by a password change")
 	}
 }
+
+func TestMustChangeUntilDefaultReplaced(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "creds.json")
+	s, err := New(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.MustChange() {
+		t.Fatal("a fresh install should require a password change")
+	}
+	for _, weak := range []string{"short", DefaultPassword} {
+		if err := s.ChangePassword(DefaultPassword, weak, ""); err != ErrWeakPassword {
+			t.Errorf("ChangePassword(%q) = %v, want ErrWeakPassword", weak, err)
+		}
+	}
+	if err := s.ChangePassword(DefaultPassword, "a-better-one", ""); err != nil {
+		t.Fatal(err)
+	}
+	if s.MustChange() {
+		t.Fatal("changing the password should clear the requirement")
+	}
+	reloaded, err := New(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.MustChange() {
+		t.Fatal("the cleared requirement should persist")
+	}
+}
+
+func TestLegacyFileWithDefaultPasswordMustChange(t *testing.T) {
+	// A credentials file from before must_change existed, still on admin/admin.
+	file := filepath.Join(t.TempDir(), "creds.json")
+	s, _ := New(file)
+	s.mu.Lock()
+	s.must = false
+	_ = s.persist()
+	s.mu.Unlock()
+
+	reloaded, err := New(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.MustChange() {
+		t.Fatal("a stored default password should be detected and flagged")
+	}
+}

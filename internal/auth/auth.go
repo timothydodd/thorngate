@@ -32,7 +32,7 @@ const (
 	saltLen        = 16
 	keyLen         = 32
 	sessionTTL     = 12 * time.Hour
-	MinPasswordLen = 4
+	MinPasswordLen = 8
 
 	// Brute-force throttling: after lockoutThreshold consecutive failed logins,
 	// login is refused for lockoutBase, doubling with each further failure up to
@@ -43,7 +43,8 @@ const (
 	lockoutMax       = 15 * time.Minute
 
 	// DefaultUsername / DefaultPassword seed a fresh install so the operator can
-	// log in immediately, then change the password from the Settings tab.
+	// log in immediately. Until the password is changed, sessions may do nothing
+	// but change it (see MustChange).
 	DefaultUsername = "admin"
 	DefaultPassword = "admin"
 )
@@ -62,6 +63,7 @@ type creds struct {
 	Salt       string `json:"salt"`
 	Hash       string `json:"hash"`
 	Iterations int    `json:"iterations"`
+	MustChange bool   `json:"must_change,omitempty"`
 }
 
 // Store holds the current credentials and live sessions. All methods are safe
@@ -73,6 +75,7 @@ type Store struct {
 	salt     []byte
 	hash     []byte
 	iter     int
+	must     bool                 // password is still the seeded default
 	sessions map[string]time.Time // token -> expiry
 
 	failures    int       // consecutive failed logins
@@ -102,6 +105,10 @@ func New(file string) (*Store, error) {
 			if s.iter <= 0 {
 				s.iter = pbkdf2Iter
 			}
+			// Files written before must_change existed: still flag an install
+			// whose password was never changed from the default.
+			s.must = c.MustChange ||
+				subtle.ConstantTimeCompare(pbkdf2Key([]byte(DefaultPassword), s.salt, s.iter, keyLen, sha256.New), s.hash) == 1
 			return s, nil
 		} else if !os.IsNotExist(err) {
 			return nil, err
@@ -111,6 +118,7 @@ func New(file string) (*Store, error) {
 	if err := s.setPassword(DefaultUsername, DefaultPassword); err != nil {
 		return nil, err
 	}
+	s.must = true
 	if file != "" {
 		// Fail fast: if the seed can't be written here, a later password change
 		// can't be either, and it would silently vanish on restart.
@@ -148,6 +156,14 @@ func (s *Store) current() (username string, salt, h []byte, iter int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.username, s.salt, s.hash, s.iter
+}
+
+// MustChange reports whether the password is still the seeded default. The
+// admin API refuses everything but a password change until it isn't.
+func (s *Store) MustChange() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.must
 }
 
 // Username returns the current admin username.
@@ -249,7 +265,7 @@ func (s *Store) ChangePassword(current, next, keepToken string) error {
 	if subtle.ConstantTimeCompare(derived, h) != 1 {
 		return ErrBadCredentials
 	}
-	if len(next) < MinPasswordLen {
+	if len(next) < MinPasswordLen || next == DefaultPassword || next == current {
 		return ErrWeakPassword
 	}
 	newSalt, newHash, err := deriveNew(next)
@@ -262,10 +278,10 @@ func (s *Store) ChangePassword(current, next, keepToken string) error {
 	if !bytes.Equal(h, s.hash) {
 		return ErrBadCredentials // changed concurrently; current is stale
 	}
-	oldSalt, oldHash, oldIter := s.salt, s.hash, s.iter
-	s.salt, s.hash, s.iter = newSalt, newHash, pbkdf2Iter
+	oldSalt, oldHash, oldIter, oldMust := s.salt, s.hash, s.iter, s.must
+	s.salt, s.hash, s.iter, s.must = newSalt, newHash, pbkdf2Iter, false
 	if err := s.persist(); err != nil {
-		s.salt, s.hash, s.iter = oldSalt, oldHash, oldIter
+		s.salt, s.hash, s.iter, s.must = oldSalt, oldHash, oldIter, oldMust
 		return err
 	}
 	for tok := range s.sessions {
@@ -297,6 +313,7 @@ func (s *Store) persist() error {
 		Salt:       base64.StdEncoding.EncodeToString(s.salt),
 		Hash:       base64.StdEncoding.EncodeToString(s.hash),
 		Iterations: s.iter,
+		MustChange: s.must,
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
