@@ -357,3 +357,96 @@ func TestExpiredExactBanStillCoveredByCIDR(t *testing.T) {
 		t.Fatal("an expired exact ban must not hide a covering CIDR ban")
 	}
 }
+
+func TestBanKey(t *testing.T) {
+	cases := []struct {
+		ip     string
+		prefix int
+		want   string
+	}{
+		{"1.2.3.4", 64, "1.2.3.4"}, // IPv4 is never widened
+		{"2400:d321:2277:3897::1", 64, "2400:d321:2277:3897::/64"},
+		{"2400:d321:2277:3897::1", 48, "2400:d321:2277::/48"},
+		{"2400:d321:2277:3897::1", 128, "2400:d321:2277:3897::1"},
+		{"2400:d321:2277:3897::1", 0, "2400:d321:2277:3897::1"},
+		{"garbage", 64, "garbage"},
+	}
+	for _, c := range cases {
+		if got := BanKey(c.ip, c.prefix); got != c.want {
+			t.Errorf("BanKey(%q, %d) = %q, want %q", c.ip, c.prefix, got, c.want)
+		}
+	}
+}
+
+func TestIPv6RangeBanCoversWholePrefix(t *testing.T) {
+	bl := newBL(t, []string{"2400:d321:2277:3897::beef"})
+	bl.Add(BanKey("2400:d321:2277:3897::1", 64), "honeypot", "/.env")
+	if !bl.IsBlocked("2400:d321:2277:3897:aaaa:bbbb:cccc:dddd") {
+		t.Fatal("another address in the banned /64 should be blocked")
+	}
+	if bl.IsBlocked("2400:d321:2277:3898::1") {
+		t.Fatal("the neighbouring /64 must not be blocked")
+	}
+	if bl.IsBlocked("2400:d321:2277:3897::beef") {
+		t.Fatal("a whitelisted address inside the /64 must stay allowed")
+	}
+	if bl.IsBlocked("1.2.3.4") {
+		t.Fatal("IPv6 ranges must not match IPv4 addresses")
+	}
+}
+
+func TestCIDRGroupsOfDifferentLengths(t *testing.T) {
+	bl := newBL(t, nil)
+	bl.Add("10.0.0.0/8", "manual", "")
+	bl.Add("192.168.1.0/24", "manual", "")
+	bl.AddTemp("172.16.5.0/24", "manual", time.Hour)
+	for ip, want := range map[string]bool{
+		"10.200.3.4":   true,
+		"192.168.1.77": true,
+		"192.168.2.1":  false,
+		"172.16.5.9":   true,
+		"8.8.8.8":      false,
+	} {
+		if got := bl.IsBlocked(ip); got != want {
+			t.Errorf("IsBlocked(%s) = %v, want %v", ip, got, want)
+		}
+	}
+	if e, ok := bl.Lookup("172.16.5.9"); !ok || e.IP != "172.16.5.0/24" || e.Until.IsZero() {
+		t.Errorf("Lookup should return the covering temp range, got %+v %v", e, ok)
+	}
+	if bl.Count() != 3 {
+		t.Errorf("Count = %d, want 3", bl.Count())
+	}
+	bl.Remove("192.168.1.0/24")
+	if bl.IsBlocked("192.168.1.77") || bl.Count() != 2 {
+		t.Error("removed range should no longer block")
+	}
+}
+
+func TestSetWhitelistTakesEffect(t *testing.T) {
+	bl := newBL(t, nil)
+	bl.Add("5.6.7.8", "manual", "")
+	bl.SetWhitelist([]string{"5.6.7.0/24"})
+	if bl.IsBlocked("5.6.7.8") {
+		t.Fatal("reloaded whitelist should exempt the IP")
+	}
+}
+
+func TestPermanentEntryOmitsUntilInJSON(t *testing.T) {
+	b, err := json.Marshal(Entry{IP: "1.2.3.4", Reason: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "until") {
+		t.Fatalf("permanent entry should omit until, got %s", b)
+	}
+	until := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	b, _ = json.Marshal(Entry{IP: "1.2.3.4", Until: until})
+	if !strings.Contains(string(b), `"until":"2030-01-01T00:00:00Z"`) {
+		t.Fatalf("temp entry should carry until, got %s", b)
+	}
+	var back Entry
+	if err := json.Unmarshal(b, &back); err != nil || !back.Until.Equal(until) {
+		t.Fatalf("round trip lost until: %+v %v", back, err)
+	}
+}
