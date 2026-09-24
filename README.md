@@ -441,3 +441,7 @@ cloudflared automatically sets `Cf-Connecting-Ip`, which is how thorngate identi
 ## Scaling beyond one replica
 
 The blacklist is per-pod (in-memory + local file). To run multiple replicas, replace the file store in `internal/blacklist` with a shared backend (Redis `SET`/`SISMEMBER` is a ~30-line swap) so all pods see the same blocklist.
+
+## License
+
+[MIT](LICENSE) © 2026 Tim Dodd
