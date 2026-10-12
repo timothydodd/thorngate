@@ -12,12 +12,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"thorngate/internal/activity"
 	"thorngate/internal/archive"
 	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
@@ -52,6 +54,11 @@ type Options struct {
 	Tarpitting func() int64
 	// Metrics serves Prometheus text metrics at /metrics, unauthenticated.
 	Metrics bool
+	// Activity is the activity log admin actions are recorded to and the
+	// portal reads (nil when disabled).
+	Activity *activity.Log
+	// Version is the running build's version, shown in the portal.
+	Version string
 }
 
 // server bundles the dependencies the handlers close over.
@@ -89,6 +96,7 @@ func Handler(o Options) http.Handler {
 	mux.HandleFunc("GET /admin/whitelist", s.authed(s.handleWhitelist))
 	mux.HandleFunc("GET /admin/whitelist/feeds", s.authed(s.handleWhitelistFeeds))
 	mux.HandleFunc("POST /admin/reload", s.authed(s.handleReload))
+	mux.HandleFunc("GET /admin/activity", s.authed(s.handleActivity))
 
 	if o.Metrics {
 		mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -166,29 +174,34 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, err := s.Auth.Login(strings.TrimSpace(body.Username), body.Password)
+	user := strings.TrimSpace(body.Username)
 	if errors.Is(err, auth.ErrLockedOut) {
 		wait := s.Auth.LockedFor()
+		s.Activity.Addf(activity.Auth, activity.Warn, remoteIP(r), user, "Login refused: locked out after too many failed attempts")
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{
 			"error": fmt.Sprintf("too many failed logins; try again in %s", wait.Round(time.Second))})
 		return
 	}
 	if err != nil {
+		s.Activity.Addf(activity.Auth, activity.Warn, remoteIP(r), user, "Failed login")
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
 	}
+	s.Activity.Addf(activity.Auth, activity.Info, remoteIP(r), user, "Logged in")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token, "username": s.Auth.Username(), "must_change": s.Auth.MustChange()})
 }
 
 func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.Auth.Logout(bearer(r))
+	s.Activity.Addf(activity.Auth, activity.Info, remoteIP(r), s.actor(r), "Logged out")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"username": s.Auth.Username(), "must_change": s.Auth.MustChange()})
+		"username": s.Auth.Username(), "must_change": s.Auth.MustChange(), "version": s.Version})
 }
 
 func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
@@ -201,8 +214,10 @@ func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	switch err := s.Auth.ChangePassword(body.Current, body.New, bearer(r)); err {
 	case nil:
+		s.Activity.Addf(activity.Auth, activity.Info, remoteIP(r), s.actor(r), "Password changed")
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	case auth.ErrBadCredentials:
+		s.Activity.Addf(activity.Auth, activity.Warn, remoteIP(r), s.actor(r), "Password change refused: wrong current password")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "current password is incorrect"})
 	case auth.ErrWeakPassword:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf(
@@ -228,6 +243,43 @@ func (s *server) handleWhitelistFeeds(w http.ResponseWriter, r *http.Request) {
 		list = append(list, s.WhitelistFeeds()...)
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	page, _ := strconv.Atoi(q.Get("page"))
+	size, _ := strconv.Atoi(q.Get("page_size"))
+	page = max(page, 1)
+	if size <= 0 {
+		size = 50
+	}
+	size = min(size, maxPageSize)
+	events, total := s.Activity.List(activity.Query{
+		Category: q.Get("category"),
+		Level:    q.Get("level"),
+		Search:   q.Get("q"),
+		Offset:   (page - 1) * size,
+		Limit:    size,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": s.Activity != nil, "events": events, "total": total, "page": page, "page_size": size})
+}
+
+// actor names who made an admin request, for the activity log.
+func (s *server) actor(r *http.Request) string {
+	if s.APIToken != "" && subtle.ConstantTimeCompare([]byte(bearer(r)), []byte(s.APIToken)) == 1 {
+		return "api token"
+	}
+	return s.Auth.Username()
+}
+
+// remoteIP is the admin client's address (the TCP peer: the admin port is
+// reached directly, never through the tunnel).
+func remoteIP(r *http.Request) string {
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return h
+	}
+	return r.RemoteAddr
 }
 
 func (s *server) handleReload(w http.ResponseWriter, r *http.Request) {

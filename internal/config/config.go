@@ -108,7 +108,26 @@ type Config struct {
 	// is a few atomic increments per request; set "disabled": true to turn it
 	// off. Counters reset on restart unless "file" points at a persistent path.
 	Stats *Stats `json:"stats"`
+
+	// Activity is OPTIONAL and ON by default. It keeps a log of events outside
+	// the request flow — bans and unbans, whitelist feed updates, config
+	// reloads, admin logins, start-up/shutdown — shown in the admin portal.
+	Activity *Activity `json:"activity"`
 }
+
+// Activity tunes the activity log. The zero value is enabled with defaults.
+type Activity struct {
+	// Disabled turns the activity log off.
+	Disabled bool `json:"disabled"`
+	// MaxEvents is how many recent events are kept. Default 1000.
+	MaxEvents int `json:"max_events"`
+	// File, when set, persists the log (JSON lines) so it survives restarts,
+	// e.g. "/data/activity.jsonl". Empty (the default) keeps it memory-only.
+	File string `json:"file"`
+}
+
+// Enabled reports whether the activity log should be kept.
+func (a *Activity) Enabled() bool { return !a.Disabled }
 
 // Stats tunes the in-memory traffic counters surfaced by the admin portal.
 // The zero value is enabled with defaults.
@@ -692,6 +711,12 @@ func Load(filePath string) (*Config, error) {
 	if err := c.Stats.compile(); err != nil {
 		return nil, fmt.Errorf("config: stats: %w", err)
 	}
+	if c.Activity == nil {
+		c.Activity = &Activity{} // on by default
+	}
+	if c.Activity.MaxEvents <= 0 {
+		c.Activity.MaxEvents = 1000
+	}
 	if c.Admin != nil && c.Admin.Enabled {
 		if c.Admin.Listen == "" {
 			c.Admin.Listen = ":9000"
@@ -736,6 +761,7 @@ func (c *Config) ReloadBlocked(old *Config) []string {
 	check("request_log", c.RequestLog, old.RequestLog)
 	check("stats", c.Stats, old.Stats)
 	check("admin", c.Admin, old.Admin)
+	check("activity", c.Activity, old.Activity)
 	return out
 }
 

@@ -137,3 +137,20 @@ export interface ImportResult {
   skipped: number
   invalid: string[]
 }
+
+export interface ActivityEvent {
+  time: string
+  category: string
+  level: 'info' | 'warn' | 'error'
+  message: string
+  ip?: string
+  actor?: string
+}
+
+export interface ActivityResponse {
+  enabled: boolean
+  events: ActivityEvent[]
+  total: number
+  page: number
+  page_size: number
+}

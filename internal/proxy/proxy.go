@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"thorngate/internal/activity"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
 	"thorngate/internal/history"
@@ -43,6 +44,7 @@ type WAF struct {
 	hist      *history.Tracker       // nil unless request_log is enabled
 	stats     *stats.Collector       // nil unless stats is enabled
 	arch      Archiver               // nil unless stats.archive is set
+	act       *activity.Log          // nil-safe; nil when the activity log is off
 
 	tarpitting atomic.Int64  // connections currently held by the tarpit
 	stop       chan struct{} // closed by ReleaseTarpits at shutdown
@@ -120,6 +122,10 @@ func sweepEvery(d time.Duration, sweep func()) {
 // SetArchive attaches long-term request storage. Call before serving; requests
 // are archived only when stats are enabled.
 func (w *WAF) SetArchive(a Archiver) { w.arch = a }
+
+// SetActivity attaches the activity log that bans are recorded to. Call before
+// serving.
+func (w *WAF) SetActivity(a *activity.Log) { w.act = a }
 
 // Reload swaps in the live-reloadable settings from cfg (see rules) and the
 // blacklist's whitelist. Settings that need a restart are left as they were;
@@ -200,6 +206,8 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		if key := w.banKeyFor(c, ip); key != "" && w.bl.Add(key, "honeypot", pattern) {
 			log.Printf("BLACKLISTED ip=%s%s path=%s honeypot=%s ua=%q total=%d",
 				ip, rangeNote(ip, key), r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
+			w.act.Addf(activity.Ban, activity.Info, key, "honeypot",
+				"Banned for hitting honeypot %s (path %s)", pattern, truncate(r.URL.Path, 200))
 			w.dumpHistory(ip, "honeypot")
 			if w.stats != nil {
 				w.stats.Honeypot()
@@ -360,6 +368,8 @@ func (w *WAF) monitorResponse(c *config.Config, ip string, status int) {
 	}
 	log.Printf("TEMP-BANNED ip=%s%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
 		ip, rangeNote(ip, key), tb.BanDuration, tb.Max, tb.Window, status, w.bl.Count())
+	w.act.Addf(activity.Ban, activity.Info, key, "temp-ban",
+		"Temporarily banned for %s (%d+ bad responses within %s)", tb.BanDuration, tb.Max, tb.Window)
 	w.dumpHistory(ip, "rate-limit")
 	if w.stats != nil {
 		w.stats.TempBan()
@@ -367,6 +377,8 @@ func (w *WAF) monitorResponse(c *config.Config, ip string, status int) {
 	if w.esc != nil && w.esc.Strike(key) && w.bl.Add(key, "repeat-offender", "") {
 		log.Printf("ESCALATED ip=%s%s to a permanent ban (%d temp-bans within %s)",
 			ip, rangeNote(ip, key), tb.EscalateAfter, tb.EscalateWindow)
+		w.act.Addf(activity.Ban, activity.Warn, key, "temp-ban",
+			"Escalated to a permanent ban (%d temp-bans within %s)", tb.EscalateAfter, tb.EscalateWindow)
 		if w.stats != nil {
 			w.stats.Escalated()
 		}

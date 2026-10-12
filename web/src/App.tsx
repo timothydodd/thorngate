@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react'
 import { api, clearToken, getToken, setMustChangeHandler, setUnauthorizedHandler } from './api'
+import Activity from './components/Activity'
 import BanDialog from './components/BanDialog'
 import Blacklist from './components/Blacklist'
 import Dashboard from './components/Dashboard'
@@ -11,13 +12,14 @@ import { Button, cx, inputClass } from './components/ui'
 import { Nav, NavContext } from './nav'
 import { RequestFilter } from './types'
 
-type Tab = 'overview' | 'requests' | 'blacklist' | 'settings'
+type Tab = 'overview' | 'requests' | 'blacklist' | 'activity' | 'settings'
 type AuthState = 'checking' | 'in' | 'out' | 'must-change'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'requests', label: 'Requests' },
   { id: 'blacklist', label: 'Blacklist' },
+  { id: 'activity', label: 'Activity' },
   { id: 'settings', label: 'Settings' },
 ]
 
@@ -27,6 +29,7 @@ const looksLikeIP = (s: string) => /^[0-9a-f:.]+(\/\d{1,3})?$/i.test(s) && (s.in
 export default function App() {
   const [auth, setAuth] = useState<AuthState>('checking')
   const [username, setUsername] = useState('')
+  const [version, setVersion] = useState('')
   const [tab, setTab] = useState<Tab>('overview')
   const [filter, setFilter] = useState<RequestFilter>(DEFAULT_FILTER)
   const [panelIP, setPanelIP] = useState<string | null>(null)
@@ -47,6 +50,7 @@ export default function App() {
       .me()
       .then((r) => {
         setUsername(r.username)
+        setVersion(r.version ?? '')
         setAuth(r.must_change ? 'must-change' : 'in')
       })
       .catch(() => setAuth('out'))
@@ -77,6 +81,10 @@ export default function App() {
 
   function onLoggedIn(name: string, mustChange: boolean) {
     setUsername(name)
+    api
+      .me()
+      .then((r) => setVersion(r.version ?? ''))
+      .catch(() => {})
     setTab('overview')
     setAuth(mustChange ? 'must-change' : 'in')
   }
@@ -137,8 +145,15 @@ export default function App() {
           {tab === 'overview' && <Dashboard />}
           {tab === 'requests' && <Requests filter={filter} onFilter={setFilter} />}
           {tab === 'blacklist' && <Blacklist />}
+          {tab === 'activity' && <Activity />}
           {tab === 'settings' && <Settings username={username} />}
         </main>
+
+        {version && (
+          <div className="fixed bottom-2 right-3 z-10 pointer-events-none select-text text-xs font-mono text-slate-400 dark:text-slate-600">
+            thorngate {version}
+          </div>
+        )}
 
         {panelIP && <IPPanel ip={panelIP} onClose={() => setPanelIP(null)} />}
         {banTarget && (

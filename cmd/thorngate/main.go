@@ -4,15 +4,18 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"thorngate/internal/activity"
 	"thorngate/internal/admin"
 	"thorngate/internal/archive"
 	"thorngate/internal/auth"
@@ -22,9 +25,40 @@ import (
 	"thorngate/internal/proxy"
 )
 
+// version is stamped at build time (-ldflags "-X main.version=v1.2.3"); see
+// buildVersion for the fallback.
+var version = ""
+
+// buildVersion reports the running version: the stamped one, else the module
+// version or VCS revision Go recorded in the binary, else "dev".
+func buildVersion() string {
+	if version != "" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+			return "dev-" + s.Value[:7]
+		}
+	}
+	return "dev"
+}
+
 func main() {
 	configPath := flag.String("config", "config.json", "path to config file")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	ver := buildVersion()
+	if *showVersion {
+		fmt.Println(ver)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -41,9 +75,20 @@ func main() {
 		log.Fatalf("proxy: %v", err)
 	}
 
+	// Activity log: bans, feed updates, reloads, logins, start/stop. A nil log
+	// (disabled) records nothing.
+	var act *activity.Log
+	if cfg.Activity.Enabled() {
+		if act, err = activity.New(cfg.Activity.MaxEvents, cfg.Activity.File); err != nil {
+			log.Fatalf("activity: %v", err)
+		}
+		waf.SetActivity(act)
+	}
+	act.Addf(activity.System, activity.Info, "", "system", "thorngate %s started (%d bans loaded)", ver, bl.Count())
+
 	// Published IP-range feeds (e.g. search crawlers) merged into the
 	// whitelist, each as its own group refreshed on its interval.
-	feedMgr := feeds.New(bl)
+	feedMgr := feeds.New(bl, act)
 	feedMgr.Apply(cfg.WhitelistFeeds)
 
 	// Optional stats persistence: pull the previous run's counters and recent
@@ -58,6 +103,7 @@ func main() {
 			for range time.Tick(cfg.Stats.SaveIntervalDur()) {
 				if err := st.Save(statsFile); err != nil {
 					log.Printf("stats: save %s: %v", statsFile, err)
+					act.Addf(activity.System, activity.Error, "", "system", "Saving stats to %s failed: %v", statsFile, err)
 				}
 			}
 		}()
@@ -87,6 +133,7 @@ func main() {
 		defer cfgMu.Unlock()
 		next, err := config.Load(*configPath)
 		if err != nil {
+			act.Addf(activity.Config, activity.Error, "", "system", "Config reload failed, kept the running config: %v", err)
 			return nil, err
 		}
 		waf.Reload(next)
@@ -96,6 +143,11 @@ func main() {
 		log.Printf("config reloaded (honeypots=%d, whitelist=%d)", len(next.Honeypots), len(next.Whitelist))
 		if len(restart) > 0 {
 			log.Printf("config: changes to %s take effect on restart", strings.Join(restart, ", "))
+			act.Addf(activity.Config, activity.Warn, "", "system",
+				"Config reloaded; changes to %s take effect on restart", strings.Join(restart, ", "))
+		} else {
+			act.Addf(activity.Config, activity.Info, "", "system", "Config reloaded (%d honeypots, %d whitelist entries, %d feeds)",
+				len(next.Honeypots), len(next.Whitelist), len(next.WhitelistFeeds))
 		}
 		return restart, nil
 	}
@@ -115,6 +167,7 @@ func main() {
 		for range time.Tick(time.Minute) {
 			if n := bl.Sweep(); n > 0 {
 				log.Printf("blacklist: swept %d expired ban(s)", n)
+				act.Addf(activity.Unban, activity.Info, "", "system", "%d expired temporary ban(s) removed", n)
 			}
 		}
 	}()
@@ -142,8 +195,8 @@ func main() {
 	srv.RegisterOnShutdown(waf.ReleaseTarpits)
 
 	go func() {
-		log.Printf("thorngate listening on %s (blacklisted=%d, routes=%d)",
-			cfg.Listen, bl.Count(), len(cfg.Routes))
+		log.Printf("thorngate %s listening on %s (blacklisted=%d, routes=%d)",
+			ver, cfg.Listen, bl.Count(), len(cfg.Routes))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server: %v", err)
 		}
@@ -173,6 +226,8 @@ func main() {
 				Reload:         reload,
 				Tarpitting:     waf.Tarpitting,
 				Metrics:        !cfg.Admin.DisableMetrics,
+				Activity:       act,
+				Version:        ver,
 			}),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
@@ -189,6 +244,7 @@ func main() {
 	<-stop
 
 	log.Println("shutting down...")
+	act.Addf(activity.System, activity.Info, "", "system", "thorngate %s shutting down", ver)
 	feedMgr.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -206,4 +262,5 @@ func main() {
 	if arch != nil {
 		arch.Close()
 	}
+	act.Close()
 }

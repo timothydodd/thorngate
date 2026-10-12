@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"thorngate/internal/activity"
 	"thorngate/internal/blacklist"
 )
 
@@ -63,12 +64,22 @@ func (s *server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
 	} else {
 		added = s.Blacklist.Add(ip, reason, "")
 	}
+	if added {
+		span := "permanently"
+		if dur > 0 {
+			span = "for " + strings.TrimSpace(body.Duration)
+		}
+		s.Activity.Addf(activity.Ban, activity.Info, ip, s.actor(r), "Banned %s from the portal (reason: %s)", span, reason)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "added": added})
 }
 
 func (s *server) handleRemoveBlacklist(w http.ResponseWriter, r *http.Request) {
 	ip := blacklist.NormalizeKey(r.PathValue("key"))
 	removed := s.Blacklist.Remove(ip)
+	if removed {
+		s.Activity.Addf(activity.Unban, activity.Info, ip, s.actor(r), "Unbanned from the portal")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ip": ip, "removed": removed})
 }
 
@@ -99,6 +110,8 @@ func (s *server) handleImportBlacklist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	added := s.Blacklist.AddMany(entries)
+	s.Activity.Addf(activity.Ban, activity.Info, "", s.actor(r),
+		"Imported blacklist: %d added, %d skipped, %d invalid", added, len(entries)-added, len(invalid))
 	if len(invalid) > 20 {
 		invalid = invalid[:20]
 	}

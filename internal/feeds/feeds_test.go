@@ -85,7 +85,7 @@ func TestRefreshAddsRemovesAndKeepsLastGood(t *testing.T) {
 	defer srv.Close()
 
 	store := &fakeStore{groups: map[string][]string{}}
-	m := New(store)
+	m := New(store, nil)
 	// Register the feed without its poller so refreshes are driven by the test.
 	ctx := context.Background()
 	m.feeds[srv.URL] = &feed{cancel: func() {}}
@@ -127,7 +127,7 @@ func TestRefreshAddsRemovesAndKeepsLastGood(t *testing.T) {
 
 func TestApplyRemovesDroppedFeedGroup(t *testing.T) {
 	store := &fakeStore{groups: map[string][]string{"https://gone.example/x": {"192.0.2.0/24"}}}
-	m := New(store)
+	m := New(store, nil)
 	m.feeds["https://gone.example/x"] = &feed{cancel: func() {}}
 	m.status["https://gone.example/x"] = &Status{URL: "https://gone.example/x"}
 
@@ -153,7 +153,7 @@ func TestRefreshUnbansCoveredEntries(t *testing.T) {
 	bl.Add("192.0.2.5", "honeypot", "/wp-admin")
 	bl.Add("203.0.113.1", "honeypot", "/.env")
 
-	m := New(bl)
+	m := New(bl, nil)
 	m.feeds[srv.URL] = &feed{cancel: func() {}}
 	m.status[srv.URL] = &Status{URL: srv.URL}
 	if err := m.refresh(context.Background(), srv.URL); err != nil {

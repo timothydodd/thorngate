@@ -2,6 +2,7 @@
 // same origin as the API, so all paths are relative.
 
 import type {
+  ActivityResponse,
   BlacklistEntry,
   HourlyResponse,
   IPProfile,
@@ -99,7 +100,7 @@ export const api = {
       password,
     }),
   logout: () => request<{ ok: boolean }>('POST', '/admin/logout'),
-  me: () => request<{ username: string; must_change: boolean }>('GET', '/admin/me'),
+  me: () => request<{ username: string; must_change: boolean; version?: string }>('GET', '/admin/me'),
   changePassword: (current_password: string, new_password: string) =>
     request<{ ok: boolean }>('POST', '/admin/password', { current_password, new_password }),
 
@@ -124,5 +125,10 @@ export const api = {
     send('POST', '/admin/blacklist/import', text, 'text/plain').then((r) => parse<ImportResult>(r)),
   whitelist: () => request<WhitelistEntry[]>('GET', '/admin/whitelist'),
   whitelistFeeds: () => request<WhitelistFeed[]>('GET', '/admin/whitelist/feeds'),
+  activity: (f: { category: string; level: string; q: string }, page: number, pageSize: number) =>
+    request<ActivityResponse>(
+      'GET',
+      '/admin/activity?' + new URLSearchParams({ ...f, page: String(page), page_size: String(pageSize) }),
+    ),
   reload: () => request<{ ok: boolean; restart_required: string[] }>('POST', '/admin/reload'),
 }

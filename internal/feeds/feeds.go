@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"thorngate/internal/activity"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
 )
@@ -62,6 +63,7 @@ type feed struct {
 // Manager runs one poller per configured feed.
 type Manager struct {
 	store  Store
+	act    *activity.Log // nil-safe
 	client *http.Client
 
 	mu     sync.Mutex
@@ -69,10 +71,12 @@ type Manager struct {
 	status map[string]*Status
 }
 
-// New returns a Manager with no feeds; call Apply to start them.
-func New(store Store) *Manager {
+// New returns a Manager with no feeds; call Apply to start them. Feed changes
+// and failures are recorded to act, which may be nil.
+func New(store Store, act *activity.Log) *Manager {
 	return &Manager{
 		store:  store,
+		act:    act,
 		client: &http.Client{Timeout: fetchTimeout},
 		feeds:  make(map[string]*feed),
 		status: make(map[string]*Status),
@@ -99,6 +103,7 @@ func (m *Manager) Apply(list []config.WhitelistFeed) {
 			delete(m.status, u)
 			m.store.SetWhitelistGroup(u, nil)
 			log.Printf("whitelist feed %s: removed", u)
+			m.act.Addf(activity.Feed, activity.Info, "", u, "Feed removed from config; its ranges left the whitelist")
 		}
 	}
 	for u, w := range want {
@@ -172,21 +177,36 @@ func (m *Manager) refresh(ctx context.Context, url string) error {
 	}
 	st.LastFetch = time.Now()
 	if err != nil {
+		// Only the first failure (or a new kind of failure) is recorded, so a
+		// long outage retried every few minutes doesn't flood the log.
+		if st.Error != err.Error() {
+			m.act.Addf(activity.Feed, activity.Warn, "", url, "Fetch failed, keeping the last good list: %v", err)
+		}
 		st.Error = err.Error()
 		m.mu.Unlock()
 		return err
 	}
+	first, recovered := st.LastOK.IsZero(), st.Error != ""
 	added, dropped := diff(st.Prefixes, prefixes)
 	st.Prefixes, st.LastOK, st.Error = prefixes, st.LastFetch, ""
 	// Under m.mu so a concurrent Apply removing this feed can't interleave.
 	m.store.SetWhitelistGroup(url, prefixes)
 	m.mu.Unlock()
 
+	switch {
+	case first:
+		m.act.Addf(activity.Feed, activity.Info, "", url, "Loaded %d ranges", len(prefixes))
+	case added > 0 || dropped > 0:
+		m.act.Addf(activity.Feed, activity.Info, "", url, "Updated: %d ranges (+%d added, -%d removed)", len(prefixes), added, dropped)
+	case recovered:
+		m.act.Addf(activity.Feed, activity.Info, "", url, "Fetching again after failures; %d ranges, unchanged", len(prefixes))
+	}
 	if added > 0 || dropped > 0 {
 		log.Printf("whitelist feed %s: %d ranges (+%d, -%d)", url, len(prefixes), added, dropped)
 	}
 	for _, e := range m.store.RemoveCovered(prefixes) {
 		log.Printf("UNBANNED ip=%s reason=%s whitelisted by feed %s", e.IP, e.Reason, url)
+		m.act.Addf(activity.Unban, activity.Info, e.IP, url, "Unbanned (was %s): inside a whitelist feed range", e.Reason)
 	}
 	return nil
 }

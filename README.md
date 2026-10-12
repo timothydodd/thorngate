@@ -75,6 +75,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `admin` | optional login-protected admin portal + API on a separate port (see below) |
 | `request_log` | per-IP request history dumped to the log on blacklist (on by default, see below) |
 | `stats` | traffic counters for the admin dashboard (on by default), plus optional on-disk request history via `stats.archive` (see below) |
+| `activity` | log of events outside the request flow — bans, unbans, feed updates, reloads, logins (on by default; see below) |
 
 Unknown keys are an **error**: a typo like `"tempban"` would otherwise silently leave a protection switched off, so thorngate refuses to start instead. Most settings can be changed without a restart — see [Reloading config](#reloading-config).
 
@@ -306,6 +307,31 @@ How it works — standard library only, no database:
 - Crash-safe: sealing writes to temp files and renames them, so an interrupted seal is simply redone at the next start, and a torn final line from a crash is skipped.
 - Sizing: an event is ~200 bytes of JSON, ~25 bytes gzipped. 1M requests/day ≈ 25 MB/day on disk; typical homelab traffic stays well under a few MB for 30 days. With an archive the in-memory feed defaults to 1,000 events (it only needs the live tail).
 
+### Activity log (`activity`)
+
+Alongside the request log, thorngate keeps an **activity log** of things that happen outside normal request handling, shown on the portal's **Activity** tab:
+
+| category | events |
+|---|---|
+| `ban` | honeypot bans, temp-bans, escalations to permanent, bans and imports from the portal |
+| `unban` | unbans from the portal, expired temp-bans swept, bans lifted because a whitelist feed now covers them |
+| `feed` | whitelist feed loaded / changed (`+added, -removed`), fetch failures (once per outage, not every retry) and recovery, feeds removed from the config |
+| `config` | reloads, including settings that still need a restart, and failed reloads |
+| `auth` | admin logins, failed logins, lock-outs, logouts, password changes |
+| `system` | start-up (with version) and shutdown, stats save failures |
+
+Each event has a time, level (`info` / `warn` / `error`), message, the IP or range it concerns, and who caused it (admin user, `api token`, feed URL, `honeypot`, `temp-ban`, `system`).
+
+```json
+"activity": { "max_events": 1000, "file": "/data/activity.jsonl" }
+```
+
+| field | meaning | default |
+|---|---|---|
+| `disabled` | turn the activity log off | `false` |
+| `max_events` | how many recent events are kept | `1000` |
+| `file` | persist events (JSON lines) so they survive restarts; the file is compacted back to `max_events` whenever it doubles | memory-only |
+
 ### Admin portal (`admin`)
 
 An optional admin server on a **separate port** hosts the portal: a **React single-page app** (embedded into the binary via `go:embed`, so no CDN and no runtime dependencies) plus the JSON API it talks to. Changes hit the in-memory store and are persisted immediately — no restart.
@@ -315,7 +341,10 @@ An optional admin server on a **separate port** hosts the portal: a **React sing
 - **IP panel** — click any IP anywhere (or type one into the header search) for its profile: ban or whitelist status (including a covering range ban), first/last seen, outcome and status breakdowns, top paths, user agent and latest requests, with **Ban** / **Unban** / **All requests** / **Range requests** actions.
 - **Ban dialog** — ban for 1h / 24h / 7d / 30d or permanently, with a reason; for an IPv6 address it offers the whole `/64`.
 - **Blacklist** — search, filter (permanent / temporary / ranges), sort, confirmed unbans, time-to-expiry for temp bans, **export** to JSON and **import** from a thorngate export or any one-IP-per-line blocklist; plus a read-only view of the whitelist and each whitelist feed's ranges.
+- **Activity** — the [activity log](#activity-log-activity): bans, unbans, feed updates, reloads and logins, filterable by type and level and searchable.
 - **Settings** — change the admin password, and **reload the config** live.
+
+The running version is shown in the bottom-right corner of the portal.
 
 | | |
 |---|---|
@@ -356,7 +385,7 @@ API (session token from `/admin/login`, or the legacy bearer token, sent as `Aut
 |--------|------|------|--------|
 | `POST` | `/admin/login` | `{"username":"...","password":"..."}` | log in → `{"token":"...","username":"...","must_change":bool}` |
 | `POST` | `/admin/logout` | — | invalidate the current session |
-| `GET` | `/admin/me` | — | current username + `must_change` (validates the session) |
+| `GET` | `/admin/me` | — | current username, `must_change` and the running `version` (validates the session) |
 | `POST` | `/admin/password` | `{"current_password":"...","new_password":"..."}` | change the admin password |
 | `GET` | `/admin/blacklist` | — | list active entries (JSON) |
 | `POST` | `/admin/blacklist` | `{"ip":"1.2.3.4","reason":"...","duration":"24h"}` | ban an IP or CIDR range; `duration` empty or `"permanent"` bans for good |
@@ -366,6 +395,7 @@ API (session token from `/admin/login`, or the legacy bearer token, sent as `Aut
 | `GET` | `/admin/whitelist` | — | the current whitelist |
 | `GET` | `/admin/whitelist/feeds` | — | each whitelist feed: `url`, `interval`, `prefixes`, `last_fetch`, `last_ok`, `error` |
 | `POST` | `/admin/reload` | — | re-read the config file → `{"ok":true,"restart_required":[...]}` |
+| `GET` | `/admin/activity?category=&level=&q=&page=1&page_size=50` | — | activity log, newest first: `category` is `ban`/`unban`/`feed`/`config`/`auth`/`system`, `level` is `info`/`warn`/`error`, `q` searches message, IP and actor |
 | `GET` | `/admin/stats` | — | traffic counters + per-minute series + archive info (`{"enabled":false}` if stats are off) |
 | `GET` | `/admin/requests?ip=&q=&outcome=&status=&range=24h&page=1&page_size=50` | — | request history, newest first: `ip` is an IP or CIDR, `q` searches path/host/query/user agent, `outcome` is `proxied`/`blocked`/`honeypot`, `status` is `2xx`..`5xx`/`none`; `page_size` max 200. Includes per-IP counts and which IPs are banned. (`/admin/stats/recent` is an alias.) |
 | `GET` | `/admin/top?range=24h&n=10` | — | busiest IPs and paths |
@@ -389,7 +419,7 @@ curl -H "Authorization: Bearer $TOKEN" "localhost:9000/admin/requests?ip=2001:db
 
 ### Reloading config
 
-Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `whitelist_feeds`, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
+Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `whitelist_feeds`, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `activity`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
 
 The container image is distroless (no shell or `kill`), so in k3s reload through the admin API:
 
@@ -414,6 +444,7 @@ npm run dev        # optional: Vite dev server on :5173, proxying /admin to :900
 ```bash
 go build -o thorngate ./cmd/thorngate
 ./thorngate -config config.json   # listens on :8765
+./thorngate -version              # prints the build version
 
 # simulate a Cloudflare request that trips the ".php contains" honeypot
 # (default block_action is tarpit — curl hangs until tarpit_duration, then the
@@ -427,7 +458,7 @@ go test ./...   # exercises the matchers
 ## CI / release
 
 - **`ci.yml`** runs `go vet`, `go build`, and `go test` on every push/PR.
-- **`release.yml`** builds a multi-arch (amd64 + arm64) image and pushes it to **GHCR** on a `vX.Y.Z` tag (or manual dispatch). Image: `ghcr.io/<owner>/<repo>`. Tag and push to publish:
+- **`release.yml`** builds a multi-arch (amd64 + arm64) image and pushes it to **GHCR** on a `vX.Y.Z` tag (or manual dispatch), stamping the tag in as the version (`-X main.version`, via the Dockerfile's `VERSION` build arg). Image: `ghcr.io/<owner>/<repo>`. Tag and push to publish:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
