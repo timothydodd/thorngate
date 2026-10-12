@@ -22,6 +22,7 @@ import (
 	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
+	"thorngate/internal/feeds"
 	"thorngate/internal/stats"
 )
 
@@ -42,6 +43,8 @@ type Options struct {
 	APIToken string
 	// Whitelist returns the current whitelist (it changes on reload).
 	Whitelist func() []config.WhitelistEntry
+	// WhitelistFeeds returns each whitelist feed's ranges and fetch status.
+	WhitelistFeeds func() []feeds.Status
 	// Reload re-reads the config file and applies what it can live, returning
 	// the changed settings that still need a restart. Nil disables reloading.
 	Reload func() (restartRequired []string, err error)
@@ -84,6 +87,7 @@ func Handler(o Options) http.Handler {
 	// deleted, e.g. DELETE /admin/blacklist/1.2.3.0/24.
 	mux.HandleFunc("DELETE /admin/blacklist/{key...}", s.authed(s.handleRemoveBlacklist))
 	mux.HandleFunc("GET /admin/whitelist", s.authed(s.handleWhitelist))
+	mux.HandleFunc("GET /admin/whitelist/feeds", s.authed(s.handleWhitelistFeeds))
 	mux.HandleFunc("POST /admin/reload", s.authed(s.handleReload))
 
 	if o.Metrics {
@@ -214,6 +218,14 @@ func (s *server) handleWhitelist(w http.ResponseWriter, r *http.Request) {
 	list := []config.WhitelistEntry{}
 	if s.Whitelist != nil {
 		list = append(list, s.Whitelist()...)
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (s *server) handleWhitelistFeeds(w http.ResponseWriter, r *http.Request) {
+	list := []feeds.Status{}
+	if s.WhitelistFeeds != nil {
+		list = append(list, s.WhitelistFeeds()...)
 	}
 	writeJSON(w, http.StatusOK, list)
 }

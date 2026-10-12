@@ -1,9 +1,9 @@
-import { FormEvent, useMemo, useState } from 'react'
+import { FormEvent, ReactNode, useMemo, useState } from 'react'
 import { api } from '../api'
 import { ago, formatNumber, fullTime, isRange, until } from '../format'
 import { usePoll } from '../hooks'
 import { useNav } from '../nav'
-import { BlacklistEntry, ImportResult, WhitelistEntry } from '../types'
+import { BlacklistEntry, ImportResult, WhitelistEntry, WhitelistFeed } from '../types'
 import { DURATIONS } from './BanDialog'
 import {
   Badge,
@@ -361,9 +361,12 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: (r: Im
 
 function Whitelist() {
   const [list, setList] = useState<WhitelistEntry[] | null>(null)
+  const [feeds, setFeeds] = useState<WhitelistFeed[]>([])
   usePoll(async () => {
     try {
-      setList(await api.whitelist())
+      const [l, f] = await Promise.all([api.whitelist(), api.whitelistFeeds()])
+      setList(l)
+      setFeeds(f)
     } catch {
       // non-critical
     }
@@ -375,17 +378,58 @@ function Whitelist() {
       ) : (
         <div className="flex flex-wrap gap-2">
           {list.map((w) => (
-            <span key={w.ip} className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 dark:border-slate-800 px-2 py-1 text-sm">
-              <span className="font-mono">{w.ip}</span>
+            <WhitelistChip key={w.ip} ip={w.ip}>
               {w.no_log && (
                 <Badge tone="sky" title="Kept out of stats and request history">
                   no log
                 </Badge>
               )}
-            </span>
+            </WhitelistChip>
           ))}
         </div>
       )}
+      {feeds.map((f) => (
+        <FeedGroup key={f.url} feed={f} />
+      ))}
     </Card>
+  )
+}
+
+// FeedGroup lists one whitelist feed's ranges, collapsed, with its fetch status.
+function FeedGroup({ feed }: { feed: WhitelistFeed }) {
+  return (
+    <details className="mt-4 border-t border-slate-200 dark:border-slate-800 pt-3">
+      <summary className="flex cursor-pointer flex-wrap items-center gap-2 text-sm">
+        <span className="font-mono break-all">{feed.url}</span>
+        <Badge>{formatNumber(feed.prefixes.length)} ranges</Badge>
+        {feed.error ? (
+          <Badge tone="rose" title={feed.error}>
+            fetch failed{feed.last_fetch ? ` ${ago(feed.last_fetch)}` : ''}
+          </Badge>
+        ) : feed.last_ok ? (
+          <Badge tone="emerald" title={fullTime(feed.last_ok)}>
+            updated {ago(feed.last_ok)}
+          </Badge>
+        ) : (
+          <Badge tone="amber">not fetched yet</Badge>
+        )}
+        <span className="text-xs text-slate-400">every {feed.interval}</span>
+      </summary>
+      {feed.error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{feed.error}</p>}
+      <div className="mt-2 flex flex-wrap gap-2">
+        {feed.prefixes.map((p) => (
+          <WhitelistChip key={p} ip={p} />
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function WhitelistChip({ ip, children }: { ip: string; children?: ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 dark:border-slate-800 px-2 py-1 text-sm">
+      <span className="font-mono">{ip}</span>
+      {children}
+    </span>
   )
 }

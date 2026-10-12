@@ -478,3 +478,61 @@ func TestAddManyWritesOnce(t *testing.T) {
 		t.Fatalf("persisted set wrong: %v", reloaded.List())
 	}
 }
+
+func TestWhitelistGroups(t *testing.T) {
+	bl := newBL(t, []string{"10.0.0.1"})
+	bl.SetWhitelistGroup("feed-a", []string{"192.0.2.0/28"})
+	bl.SetWhitelistGroup("feed-b", []string{"198.51.100.7"})
+	for _, ip := range []string{"10.0.0.1", "192.0.2.5", "198.51.100.7"} {
+		if !bl.IsWhitelisted(ip) {
+			t.Errorf("%s should be whitelisted", ip)
+		}
+	}
+
+	// A config reload replaces only the static entries.
+	bl.SetWhitelist(nil)
+	if bl.IsWhitelisted("10.0.0.1") || !bl.IsWhitelisted("192.0.2.5") {
+		t.Error("SetWhitelist must replace static entries and keep feed groups")
+	}
+
+	// A refresh replaces only that feed's group; dropped ranges leave.
+	bl.SetWhitelistGroup("feed-a", []string{"192.0.2.16/28"})
+	if bl.IsWhitelisted("192.0.2.5") || !bl.IsWhitelisted("192.0.2.20") || !bl.IsWhitelisted("198.51.100.7") {
+		t.Error("refreshing a group must drop its old ranges and keep other groups")
+	}
+
+	bl.SetWhitelistGroup("feed-b", nil)
+	if bl.IsWhitelisted("198.51.100.7") {
+		t.Error("an empty group should be removed")
+	}
+}
+
+func TestRemoveCovered(t *testing.T) {
+	bl := newBL(t, nil)
+	bl.Add("192.0.2.5", "honeypot", "/wp-admin")   // inside: removed
+	bl.AddTemp("192.0.2.9", "temp-ban", time.Hour) // inside: removed
+	bl.Add("192.0.2.0/30", "manual", "")           // range inside: removed
+	bl.Add("192.0.0.0/16", "manual", "")           // wider than the feed: kept
+	bl.Add("203.0.113.1", "honeypot", "/.env")     // outside: kept
+	bl.Add("2001:db8::/64", "honeypot", "/.git")   // inside the v6 range: removed
+
+	removed := bl.RemoveCovered([]string{"192.0.2.0/28", "2001:db8::/48"})
+	got := map[string]bool{}
+	for _, e := range removed {
+		got[e.IP] = true
+	}
+	for _, k := range []string{"192.0.2.5", "192.0.2.9", "192.0.2.0/30", "2001:db8::/64"} {
+		if !got[k] {
+			t.Errorf("%s should have been unbanned", k)
+		}
+	}
+	if len(removed) != 4 {
+		t.Errorf("removed %d entries, want 4: %v", len(removed), removed)
+	}
+	if bl.Count() != 2 {
+		t.Errorf("Count = %d, want 2 (the /16 and 203.0.113.1)", bl.Count())
+	}
+	if bl.RemoveCovered([]string{"192.0.2.0/28"}) != nil {
+		t.Error("nothing left to remove should return nil")
+	}
+}

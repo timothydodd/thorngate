@@ -18,6 +18,7 @@ import (
 	"thorngate/internal/auth"
 	"thorngate/internal/blacklist"
 	"thorngate/internal/config"
+	"thorngate/internal/feeds"
 	"thorngate/internal/proxy"
 )
 
@@ -39,6 +40,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("proxy: %v", err)
 	}
+
+	// Published IP-range feeds (e.g. search crawlers) merged into the
+	// whitelist, each as its own group refreshed on its interval.
+	feedMgr := feeds.New(bl)
+	feedMgr.Apply(cfg.WhitelistFeeds)
 
 	// Optional stats persistence: pull the previous run's counters and recent
 	// requests back in, then re-save on an interval (and once more on shutdown).
@@ -84,6 +90,7 @@ func main() {
 			return nil, err
 		}
 		waf.Reload(next)
+		feedMgr.Apply(next.WhitelistFeeds)
 		current = next
 		restart := next.ReloadBlocked(cfg)
 		log.Printf("config reloaded (honeypots=%d, whitelist=%d)", len(next.Honeypots), len(next.Whitelist))
@@ -162,9 +169,10 @@ func main() {
 					defer cfgMu.Unlock()
 					return current.Whitelist
 				},
-				Reload:     reload,
-				Tarpitting: waf.Tarpitting,
-				Metrics:    !cfg.Admin.DisableMetrics,
+				WhitelistFeeds: feedMgr.Statuses,
+				Reload:         reload,
+				Tarpitting:     waf.Tarpitting,
+				Metrics:        !cfg.Admin.DisableMetrics,
 			}),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
@@ -181,6 +189,7 @@ func main() {
 	<-stop
 
 	log.Println("shutting down...")
+	feedMgr.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if adminSrv != nil {

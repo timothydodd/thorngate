@@ -298,3 +298,33 @@ func TestReloadBlocked(t *testing.T) {
 		t.Errorf("upstream+listen need a restart, got %v", got)
 	}
 }
+
+func TestWhitelistFeeds(t *testing.T) {
+	c, err := loadJSON(t, `{"upstream":"10.0.0.1","whitelist_feeds":[
+		"https://openai.com/searchbot.json",
+		{"url":"https://example.com/ips.txt","interval":"30m"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.WhitelistFeeds) != 2 {
+		t.Fatalf("got %d feeds, want 2", len(c.WhitelistFeeds))
+	}
+	if f := c.WhitelistFeeds[0]; f.URL != "https://openai.com/searchbot.json" || f.IntervalDur() != 6*time.Hour {
+		t.Errorf("shorthand feed = %q every %v, want default 6h", f.URL, f.IntervalDur())
+	}
+	if d := c.WhitelistFeeds[1].IntervalDur(); d != 30*time.Minute {
+		t.Errorf("interval = %v, want 30m", d)
+	}
+
+	for _, bad := range []string{
+		`["ftp://example.com/x"]`,
+		`["not a url"]`,
+		`[{"url":"https://example.com/x","interval":"10s"}]`,
+		`[{"url":"https://example.com/x","intervall":"1h"}]`,
+		`["https://example.com/x","https://example.com/x"]`,
+	} {
+		if _, err := loadJSON(t, `{"upstream":"10.0.0.1","whitelist_feeds":`+bad+`}`); err == nil {
+			t.Errorf("whitelist_feeds %s should be rejected", bad)
+		}
+	}
+}

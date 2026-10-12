@@ -11,6 +11,7 @@ import type {
   StatsResponse,
   TopResponse,
   WhitelistEntry,
+  WhitelistFeed,
 } from './types'
 
 const TOKEN_KEY = 'tg_token'
@@ -122,5 +123,6 @@ export const api = {
   importBlacklist: (text: string) =>
     send('POST', '/admin/blacklist/import', text, 'text/plain').then((r) => parse<ImportResult>(r)),
   whitelist: () => request<WhitelistEntry[]>('GET', '/admin/whitelist'),
+  whitelistFeeds: () => request<WhitelistFeed[]>('GET', '/admin/whitelist/feeds'),
   reload: () => request<{ ok: boolean; restart_required: string[] }>('POST', '/admin/reload'),
 }

@@ -69,6 +69,14 @@ type Config struct {
 	// { "ip": "107.214.211.*", "no_log": true }.
 	Whitelist []WhitelistEntry `json:"whitelist"`
 
+	// WhitelistFeeds are OPTIONAL published IP-range lists (e.g. a search
+	// crawler's "https://openai.com/searchbot.json") fetched periodically and
+	// added to the whitelist, so those clients are never banned — not even for
+	// tripping a honeypot. Each feed's ranges are kept as their own group: a
+	// refresh adds what is new, drops what the feed no longer lists, and unbans
+	// existing bans that fall inside its ranges.
+	WhitelistFeeds []WhitelistFeed `json:"whitelist_feeds"`
+
 	// Upstream is the default internal target that ALL traffic is proxied to
 	// unless a hostname route below matches. Accepts an IP/host with optional
 	// port and optional scheme, e.g. "10.0.0.10:8080", "10.0.0.10",
@@ -360,6 +368,60 @@ func (e *WhitelistEntry) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// WhitelistFeed is a remote list of IP ranges to whitelist. In JSON it may be:
+//
+//	"https://openai.com/searchbot.json"                          // default interval
+//	{ "url": "https://openai.com/searchbot.json", "interval": "1h" }
+//
+// The body may be the JSON format published by OpenAI, Google and Bing
+// ({"prefixes": [{"ipv4Prefix": "..."}, {"ipv6Prefix": "..."}]}) or plain text
+// with one IP/CIDR per line ('#' starts a comment).
+type WhitelistFeed struct {
+	URL string `json:"url"`
+	// Interval is how often the feed is re-fetched (Go duration). Default "6h".
+	Interval string `json:"interval"`
+
+	interval time.Duration
+}
+
+// UnmarshalJSON lets a whitelist feed be a bare URL string or a full object.
+func (f *WhitelistFeed) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*f = WhitelistFeed{URL: s}
+		return nil
+	}
+	type raw WhitelistFeed // avoid recursing into this method
+	var r raw
+	if err := strictUnmarshal(b, &r); err != nil {
+		return err
+	}
+	*f = WhitelistFeed(r)
+	return nil
+}
+
+func (f *WhitelistFeed) compile() error {
+	u, err := url.Parse(f.URL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("url %q: want an http(s) URL", f.URL)
+	}
+	if f.Interval == "" {
+		f.Interval = "6h"
+	}
+	d, err := positiveDuration("interval", f.Interval)
+	if err != nil {
+		return err
+	}
+	if d < time.Minute {
+		return fmt.Errorf("interval %q: must be at least 1m", f.Interval)
+	}
+	f.interval = d
+	return nil
+}
+
+// IntervalDur returns the parsed refresh interval.
+func (f *WhitelistFeed) IntervalDur() time.Duration { return f.interval }
+
 // WhitelistSpecs returns the address specs of every whitelist entry, for
 // building the never-blacklist set.
 func (c *Config) WhitelistSpecs() []string {
@@ -576,6 +638,17 @@ func Load(filePath string) (*Config, error) {
 			return nil, fmt.Errorf("config: route %d upstream %q: %w", i, r.Upstream, err)
 		}
 	}
+	seenFeeds := make(map[string]bool, len(c.WhitelistFeeds))
+	for i := range c.WhitelistFeeds {
+		f := &c.WhitelistFeeds[i]
+		if err := f.compile(); err != nil {
+			return nil, fmt.Errorf("config: whitelist_feeds %d: %w", i, err)
+		}
+		if seenFeeds[f.URL] {
+			return nil, fmt.Errorf("config: whitelist_feeds %d: duplicate url %q", i, f.URL)
+		}
+		seenFeeds[f.URL] = true
+	}
 	for i := range c.Honeypots {
 		if err := c.Honeypots[i].compile(); err != nil {
 			return nil, fmt.Errorf("config: honeypot %d: %w", i, err)
@@ -644,7 +717,7 @@ func strictUnmarshal(b []byte, v any) error {
 }
 
 // ReloadBlocked lists the settings that differ between c and old but only take
-// effect on restart. Everything else — honeypots, whitelist, block action,
+// effect on restart. Everything else — honeypots, whitelist, whitelist feeds, block action,
 // tarpit, client IP / country headers, ipv6_ban_prefix — applies on reload.
 func (c *Config) ReloadBlocked(old *Config) []string {
 	var out []string

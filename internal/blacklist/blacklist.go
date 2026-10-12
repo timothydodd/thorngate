@@ -56,9 +56,14 @@ type Blacklist struct {
 	cidrs   map[maskShape]map[string]Entry
 	file    string
 
-	// whitelist holds parsed CIDRs / single IPs that are never blocked. It is
-	// swapped atomically on config reload, so it is read without the lock.
+	// whitelist holds parsed CIDRs / single IPs that are never blocked: the
+	// config's static entries plus every feed group, flattened. It is swapped
+	// atomically whenever a group changes, so it is read without the lock.
 	whitelist atomic.Pointer[[]*net.IPNet]
+
+	wlMu     sync.Mutex              // guards wlStatic/wlGroups while rebuilding
+	wlStatic []*net.IPNet            // from config (SetWhitelist)
+	wlGroups map[string][]*net.IPNet // per whitelist feed (SetWhitelistGroup)
 
 	gen       uint64     // bumped on every mutation (guarded by mu)
 	persistMu sync.Mutex // serializes disk writes
@@ -231,9 +236,39 @@ func New(file string, whitelist []string) (*Blacklist, error) {
 	return b, nil
 }
 
-// SetWhitelist replaces the whitelist (e.g. on config reload).
+// SetWhitelist replaces the static (config) whitelist, e.g. on config reload.
+// Feed groups set with SetWhitelistGroup are left as they are.
 func (b *Blacklist) SetWhitelist(specs []string) {
 	nets := ParseNets(specs)
+	b.wlMu.Lock()
+	defer b.wlMu.Unlock()
+	b.wlStatic = nets
+	b.rebuildWhitelistLocked()
+}
+
+// SetWhitelistGroup replaces one named group of whitelisted ranges (one per
+// whitelist feed), so a feed's refresh adds and removes only its own entries.
+// A nil or empty specs removes the group.
+func (b *Blacklist) SetWhitelistGroup(name string, specs []string) {
+	nets := ParseNets(specs)
+	b.wlMu.Lock()
+	defer b.wlMu.Unlock()
+	if len(nets) == 0 {
+		delete(b.wlGroups, name)
+	} else {
+		if b.wlGroups == nil {
+			b.wlGroups = make(map[string][]*net.IPNet)
+		}
+		b.wlGroups[name] = nets
+	}
+	b.rebuildWhitelistLocked()
+}
+
+func (b *Blacklist) rebuildWhitelistLocked() {
+	nets := append([]*net.IPNet(nil), b.wlStatic...)
+	for _, g := range b.wlGroups {
+		nets = append(nets, g...)
+	}
 	b.whitelist.Store(&nets)
 }
 
@@ -504,6 +539,54 @@ func (b *Blacklist) Remove(ip string) bool {
 	b.mu.Unlock()
 	b.persist(snap)
 	return true
+}
+
+// RemoveCovered unbans every entry that lies entirely inside one of the given
+// ranges (IPs, CIDRs or wildcards, as for the whitelist) and returns what it
+// removed. A banned range only partly covered is kept; IsBlocked already lets
+// the whitelisted part through.
+func (b *Blacklist) RemoveCovered(specs []string) []Entry {
+	nets := ParseNets(specs)
+	if len(nets) == 0 {
+		return nil
+	}
+	var removed []Entry
+	b.mu.Lock()
+	for k, e := range b.entries {
+		if ip := net.ParseIP(k); ip != nil && containsIP(nets, ip) {
+			delete(b.entries, k)
+			removed = append(removed, e)
+		}
+	}
+	for _, m := range b.cidrs {
+		for k, e := range m {
+			if _, n, err := net.ParseCIDR(k); err == nil && coversNet(nets, n) {
+				delete(m, k)
+				removed = append(removed, e)
+			}
+		}
+	}
+	if len(removed) == 0 {
+		b.mu.Unlock()
+		return nil
+	}
+	b.pruneLocked()
+	snap := b.changedLocked()
+	b.mu.Unlock()
+	b.persist(snap)
+	return removed
+}
+
+// coversNet reports whether one of nets contains all of n.
+func coversNet(nets []*net.IPNet, n *net.IPNet) bool {
+	ones, bits := n.Mask.Size()
+	for _, w := range nets {
+		wo, wb := w.Mask.Size()
+		if wb == bits && wo <= ones && w.Contains(n.IP) {
+			return true
+		}
+	}
+	return false
 }
 
 // Count returns the number of blacklisted entries (exact IPs and CIDR ranges).

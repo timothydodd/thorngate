@@ -64,6 +64,7 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `ipv6_ban_prefix` | automatic bans of an IPv6 client cover its whole network of this prefix length — default `64`; `128` bans single addresses (see below) |
 | `blacklist_file` | where to persist blocked IPs (mount a volume in k8s) |
 | `whitelist` | IPs never blacklisted (your own IP, internal ranges) — see below |
+| `whitelist_feeds` | published IP-range lists (e.g. search crawlers) fetched periodically and whitelisted — see below |
 | `honeypots` | patterns that trigger an instant blacklist (see below) |
 | `block_action` | what blocked clients get: `tarpit` (default, never respond), `drop`, or `forbidden` (plain 403) — see below |
 | `tarpit_duration` | max time a `tarpit` connection is held, default `100s` |
@@ -96,6 +97,25 @@ Each entry is either a **bare string** or an **object**. The address may be a si
 A range like `107.214.211.0/24` covers `107.214.211.0`–`107.214.211.255`. The wildcard forms are just shorthand: `107.214.211.*` → `/24`, `107.214.*` → `/16`, `107.*` → `/8` (the `*`s must be the trailing octets).
 
 Set **`no_log`** on an entry (object form) to also exclude its traffic from the **stats dashboard** and **request history** entirely. Use it for your own health checks / uptime monitors that would otherwise flood the live feed. A `no_log` IP is proxied straight through with no response wrapping, so it adds zero per-request overhead.
+
+### Whitelist feeds (`whitelist_feeds`)
+
+Search crawlers publish the IP ranges they crawl from. List those feeds here and thorngate fetches each one on start-up and then every `interval`, whitelisting its ranges — so a legitimate crawler that wanders into a honeypot path is denied the request but **never banned**.
+
+```json
+"whitelist_feeds": [
+  "https://openai.com/searchbot.json",                                   // default interval: 6h
+  { "url": "https://openai.com/gptbot.json", "interval": "1h" },
+  { "url": "https://developers.google.com/static/search/apis/ipranges/googlebot.json", "interval": "12h" }
+]
+```
+
+- **Formats:** the `{"prefixes": [{"ipv4Prefix": "…"}, {"ipv6Prefix": "…"}]}` JSON used by OpenAI, Google and Bing, or plain text with one IP/CIDR per line (`#` starts a comment).
+- **Each feed is its own group.** A successful fetch replaces that feed's ranges outright: new ranges are added, ranges the feed no longer lists are **removed from the whitelist**, and your static `whitelist` and other feeds are untouched.
+- **Existing bans are lifted.** After each fetch, any ban that lies entirely inside the feed's ranges (an IP, or a narrower range) is removed from the blacklist and logged as `UNBANNED ip=… whitelisted by feed …`. A wider banned range that merely overlaps is kept — the whitelisted addresses inside it get through anyway.
+- **Failures keep the last good list.** An HTTP error, a parse error or a feed with no usable ranges leaves the previous ranges in place and retries in 5 minutes (or `interval`, if shorter). Feeds are held in memory, so they're re-fetched after a restart.
+- **Guard rails:** `interval` must be at least `1m`; ranges broader than IPv4 `/8` or IPv6 `/16` are ignored, so a broken feed can't whitelist the internet; responses over 4 MB are refused.
+- Feeds apply on config reload: added feeds start, removed feeds stop and their ranges leave the whitelist. The portal's **Blacklist** tab shows each feed's ranges and last fetch status.
 
 ### Honeypot matching
 
@@ -294,7 +314,7 @@ An optional admin server on a **separate port** hosts the portal: a **React sing
 - **Requests** — the request log, searchable by **IP or CIDR range**, free text (path, host, query, user agent), outcome, status class and time range. Rows show country, a request-count badge for chatty IPs and a `banned` marker; only page 1 refreshes live, so older pages don't shift while you read.
 - **IP panel** — click any IP anywhere (or type one into the header search) for its profile: ban or whitelist status (including a covering range ban), first/last seen, outcome and status breakdowns, top paths, user agent and latest requests, with **Ban** / **Unban** / **All requests** / **Range requests** actions.
 - **Ban dialog** — ban for 1h / 24h / 7d / 30d or permanently, with a reason; for an IPv6 address it offers the whole `/64`.
-- **Blacklist** — search, filter (permanent / temporary / ranges), sort, confirmed unbans, time-to-expiry for temp bans, **export** to JSON and **import** from a thorngate export or any one-IP-per-line blocklist; plus a read-only view of the whitelist.
+- **Blacklist** — search, filter (permanent / temporary / ranges), sort, confirmed unbans, time-to-expiry for temp bans, **export** to JSON and **import** from a thorngate export or any one-IP-per-line blocklist; plus a read-only view of the whitelist and each whitelist feed's ranges.
 - **Settings** — change the admin password, and **reload the config** live.
 
 | | |
@@ -344,6 +364,7 @@ API (session token from `/admin/login`, or the legacy bearer token, sent as `Aut
 | `GET` | `/admin/blacklist/export` | — | download all active entries as JSON |
 | `POST` | `/admin/blacklist/import` | JSON array (as exported) **or** plain text, one IP/CIDR per line | bulk-add bans with a single disk write → `{"added":n,"skipped":n,"invalid":[...]}` |
 | `GET` | `/admin/whitelist` | — | the current whitelist |
+| `GET` | `/admin/whitelist/feeds` | — | each whitelist feed: `url`, `interval`, `prefixes`, `last_fetch`, `last_ok`, `error` |
 | `POST` | `/admin/reload` | — | re-read the config file → `{"ok":true,"restart_required":[...]}` |
 | `GET` | `/admin/stats` | — | traffic counters + per-minute series + archive info (`{"enabled":false}` if stats are off) |
 | `GET` | `/admin/requests?ip=&q=&outcome=&status=&range=24h&page=1&page_size=50` | — | request history, newest first: `ip` is an IP or CIDR, `q` searches path/host/query/user agent, `outcome` is `proxied`/`blocked`/`honeypot`, `status` is `2xx`..`5xx`/`none`; `page_size` max 200. Includes per-IP counts and which IPs are banned. (`/admin/stats/recent` is an alias.) |
@@ -368,7 +389,7 @@ curl -H "Authorization: Bearer $TOKEN" "localhost:9000/admin/requests?ip=2001:db
 
 ### Reloading config
 
-Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
+Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `whitelist_feeds`, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
 
 The container image is distroless (no shell or `kill`), so in k3s reload through the admin API:
 

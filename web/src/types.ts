@@ -123,6 +123,15 @@ export interface WhitelistEntry {
   no_log: boolean
 }
 
+export interface WhitelistFeed {
+  url: string
+  interval: string
+  prefixes: string[]
+  last_fetch?: string
+  last_ok?: string
+  error?: string
+}
+
 export interface ImportResult {
   added: number
   skipped: number
