@@ -7,7 +7,8 @@
 A tiny, zero-dependency Go reverse-proxy WAF that sits behind a **Cloudflare Tunnel** and in front of your web/API services — a gate at the mouth of the tunnel that snags intruders. It:
 
 - Reverse-proxies all traffic to a **default upstream**, with optional **hostname → upstream** overrides (k8s services or raw IPs), including **WebSocket / SignalR** (protocol-upgrade) connections.
-- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** and ghosted on every future request — by default the connection is tarpitted (held open, never answered) and then dropped; `block_action` can switch this to an instant drop or a plain `403`. IPv6 clients are banned by their whole **/64**, since scanners rotate through it.
+- Treats configured patterns as **honeypots**. Any external IP that matches one is **blacklisted instantly** (for good, or for a per-honeypot `ban_for` such as `24h`) and ghosted on every future request — by default the connection is tarpitted (held open, never answered) and then dropped; `block_action` can switch this to an instant drop or a plain `403`. IPv6 clients are banned by their whole **/64**, since scanners rotate through it.
+- Matches on the **request path** or on a **request header** (`Referer`, `User-Agent`, …), so referrer spam or a bad bot can be trapped too. **Block rules** use the same matchers to deny a request *without* banning anyone.
 - Optionally **temp-bans** clients that rack up bad responses, and **escalates** repeat offenders to permanent bans.
 - Resolves the real external IP from Cloudflare's `Cf-Connecting-Ip` header.
 - Persists the blacklist to disk so it survives restarts, and can keep **weeks of searchable request history** on disk.
@@ -27,8 +28,9 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 
 1. Read client IP from `Cf-Connecting-Ip`.
 2. If IP is blacklisted → tarpit (default; or drop/403, per `block_action`).
-3. If the path matches a honeypot → blacklist the IP, persist, tarpit.
-4. Otherwise proxy to the route whose `host` matches, or the default upstream.
+3. If the path (or a header) matches a honeypot → blacklist the IP, persist, tarpit.
+4. If it matches a block rule → tarpit, but don't ban.
+5. Otherwise proxy to the route whose `host` matches, or the default upstream.
 
 `/healthz` is reserved for k8s probes (never proxied, never a honeypot).
 
@@ -65,7 +67,8 @@ Internet → Cloudflare → cloudflared (tunnel) → thorngate (this) → your a
 | `blacklist_file` | where to persist blocked IPs (mount a volume in k8s) |
 | `whitelist` | IPs never blacklisted (your own IP, internal ranges) — see below |
 | `whitelist_feeds` | published IP-range lists (e.g. search crawlers) fetched periodically and whitelisted — see below |
-| `honeypots` | patterns that trigger an instant blacklist (see below) |
+| `honeypots` | patterns that trigger an instant blacklist — permanent, or for the honeypot's `ban_for` (see below) |
+| `block_rules` | same matchers, but only deny the request; the client is not banned (see below) |
 | `block_action` | what blocked clients get: `tarpit` (default, never respond), `drop`, or `forbidden` (plain 403) — see below |
 | `tarpit_duration` | max time a `tarpit` connection is held, default `100s` |
 | `tarpit_max` | max connections held by the tarpit at once (overflow is dropped instead), default `512` |
@@ -144,6 +147,40 @@ A honeypot is either a **bare string** (prefix match) or an **object** with a `m
 - Paths are checked both as sent and **cleaned** (`//wp-admin`, `/x/../wp-admin` and `/x\..\wp-admin` all count as `/wp-admin`), since that is what an upstream would serve.
 - A honeypot that matches the site root `/` (e.g. `""`, `"/"`, `{"pattern": ".*", "match": "regex"}`) is rejected at startup — it would ban every visitor on their first request.
 
+#### Header honeypots
+
+Add `"header"` to match a **request header's value** instead of the path — e.g. to trap referrer spam or a known-bad user agent:
+
+```json
+"honeypots": [
+  { "header": "Referer",    "pattern": "aocr.org",   "match": "contains", "ban_for": "24h" },
+  { "header": "User-Agent", "pattern": "^evilbot/",  "match": "regex" }
+]
+```
+
+- The same `match` modes apply to the header value. `prefix` is a plain string prefix here (no `/` boundary), and `glob` must match the whole value.
+- A request **without** the header never matches. A pattern that would match an *empty* value (`.*`, `^`, `*`) is rejected at startup, since it would catch everyone who sends the header at all.
+- The ban is recorded against `Referer: aocr.org` (header + pattern) in the blacklist and activity log, with the offending header value in the log line.
+
+#### Temporary honeypot bans (`ban_for`)
+
+By default a honeypot ban is **permanent**. Add `"ban_for"` (a Go duration such as `"24h"` or `"30m"`) to any object-form honeypot to make its bans **expire** instead — handy for nuisance traffic you want gone but that isn't worth banning forever. Expiry works exactly like a temp-ban (see below): lifted on the IP's next request or by the sweep, and a later permanent ban still outranks it.
+
+#### Block rules (`block_rules`)
+
+`block_rules` take the **same matchers** (path or header, any `match` mode) but only **deny the matching request** — with the usual `block_action` — and **never ban** the client. Use them for traffic that is unwanted rather than hostile, where banning the IP would be heavy-handed (shared NATs, the odd misconfigured link):
+
+```json
+"block_rules": [
+  { "header": "Referer", "pattern": "aocr.org", "match": "contains" },
+  "/internal-only"
+]
+```
+
+- Checked after the blacklist and honeypots, before routing. The client's other requests are served as normal.
+- `ban_for` is not allowed on a block rule (if you want a ban, it's a honeypot). The site-root and match-everything guards apply here too.
+- Denials show up in the request feed with outcome `rule` and in the log as `BLOCKED … rule="Referer: aocr.org"`. They are not counted in the dashboard's blacklist-block or honeypot totals.
+
 ### IPv6 range bans (`ipv6_ban_prefix`)
 
 An IPv6 client almost always holds an entire `/64` and can hop to any of its 2⁶⁴ addresses at will, so banning the one address that tripped a honeypot achieves nothing — the next request simply comes from `…::2`. thorngate therefore bans the client's whole network: a honeypot hit or temp-ban from `2001:db8:bad:7::2` bans `2001:db8:bad:7::/64`, and temp-ban strikes are counted per `/64` too, so a scanner rotating addresses adds up as one client.
@@ -197,7 +234,7 @@ If you only need a single backend, just set `upstream` and omit `routes` entirel
 
 ### Temporary bans (`temp_ban`)
 
-Honeypots are an *instant, permanent* ban. `temp_ban` is the softer, optional layer: it watches the **response codes** your upstreams return and **temporarily** blacklists an IP that produces too many bad ones — e.g. a scanner racking up 404s.
+Honeypots are an *instant* ban (permanent unless the honeypot sets `ban_for`). `temp_ban` is the softer, optional layer: it watches the **response codes** your upstreams return and **temporarily** blacklists an IP that produces too many bad ones — e.g. a scanner racking up 404s.
 
 ```json
 "temp_ban": {
@@ -260,7 +297,7 @@ It is **on by default** with sensible bounds — disable or tune it with a `requ
 
 ### Traffic stats (`stats`)
 
-thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, a 2xx/3xx/4xx/5xx breakdown of proxied responses, and total **data sent** (response bytes written to clients by proxied requests), plus a per-minute requests-vs-blocked chart and a **paginated feed of the last 24 hours of requests** (time, IP, method, host, path + query, the upstream it was routed to, status, bytes sent, and outcome — `proxied` / `blocked` / `honeypot`). The host and upstream columns make it easy to spot routing problems — e.g. a hostname that isn't matching its route and falling through to the default upstream.
+thorngate keeps lightweight in-memory counters so the admin **Dashboard** can show traffic at a glance: total requests, requests blocked by the blacklist, honeypot bans, temp-bans, a 2xx/3xx/4xx/5xx breakdown of proxied responses, and total **data sent** (response bytes written to clients by proxied requests), plus a per-minute requests-vs-blocked chart and a **paginated feed of the last 24 hours of requests** (time, IP, method, host, path + query, the upstream it was routed to, status, bytes sent, and outcome — `proxied` / `blocked` / `honeypot` / `rule`). The host and upstream columns make it easy to spot routing problems — e.g. a hostname that isn't matching its route and falling through to the default upstream.
 
 It is **on by default** — the headline totals are lock-free atomics and the time series is a small per-minute ring buffer, so the overhead is a few increments per request. Disable or tune it with a `stats` block:
 
@@ -397,7 +434,7 @@ API (session token from `/admin/login`, or the legacy bearer token, sent as `Aut
 | `POST` | `/admin/reload` | — | re-read the config file → `{"ok":true,"restart_required":[...]}` |
 | `GET` | `/admin/activity?category=&level=&q=&page=1&page_size=50` | — | activity log, newest first: `category` is `ban`/`unban`/`feed`/`config`/`auth`/`system`, `level` is `info`/`warn`/`error`, `q` searches message, IP and actor |
 | `GET` | `/admin/stats` | — | traffic counters + per-minute series + archive info (`{"enabled":false}` if stats are off) |
-| `GET` | `/admin/requests?ip=&q=&outcome=&status=&range=24h&page=1&page_size=50` | — | request history, newest first: `ip` is an IP or CIDR, `q` searches path/host/query/user agent, `outcome` is `proxied`/`blocked`/`honeypot`, `status` is `2xx`..`5xx`/`none`; `page_size` max 200. Includes per-IP counts and which IPs are banned. (`/admin/stats/recent` is an alias.) |
+| `GET` | `/admin/requests?ip=&q=&outcome=&status=&range=24h&page=1&page_size=50` | — | request history, newest first: `ip` is an IP or CIDR, `q` searches path/host/query/user agent, `outcome` is `proxied`/`blocked`/`honeypot`/`rule`, `status` is `2xx`..`5xx`/`none`; `page_size` max 200. Includes per-IP counts and which IPs are banned. (`/admin/stats/recent` is an alias.) |
 | `GET` | `/admin/top?range=24h&n=10` | — | busiest IPs and paths |
 | `GET` | `/admin/hourly?range=7d` | — | requests / blocked per hour |
 | `GET` | `/admin/ip/{ip}?range=30d` | — | one client's profile: ban (incl. covering range), whitelisted, traffic summary |
@@ -419,7 +456,7 @@ curl -H "Authorization: Bearer $TOKEN" "localhost:9000/admin/requests?ip=2001:db
 
 ### Reloading config
 
-Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, the whitelist, `whitelist_feeds`, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `activity`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
+Send the process `SIGHUP` (or use **Settings → Reload config** / `POST /admin/reload`) to re-read the config file without dropping connections. **Honeypots, `block_rules`, the whitelist, `whitelist_feeds`, `block_action`, tarpit settings, `client_ip_header`, `country_header` and `ipv6_ban_prefix`** apply immediately. Changes to `listen`, `upstream`, `routes`, `temp_ban`, `request_log`, `stats`, `activity`, `admin` or `blacklist_file` are reported as needing a restart. A config that fails to load is rejected and the running config is kept.
 
 The container image is distroless (no shell or `kill`), so in k3s reload through the admin API:
 

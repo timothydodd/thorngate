@@ -51,7 +51,7 @@ type Event struct {
 	Path     string    `json:"path"`
 	Query    string    `json:"query,omitempty"`
 	Status   int       `json:"status"`
-	Outcome  string    `json:"outcome"`            // "proxied", "blocked", or "honeypot"
+	Outcome  string    `json:"outcome"`            // "proxied", "blocked", "honeypot", or "rule"
 	Deny     string    `json:"deny,omitempty"`     // how a denied request ended: "tarpit" or "drop"; empty when a 403 was written (or the request was proxied)
 	Upstream string    `json:"upstream,omitempty"` // resolved upstream URL; empty when never proxied
 	Bytes    int64     `json:"bytes"`              // response bytes sent to the client; 0 when never proxied

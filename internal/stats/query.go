@@ -27,7 +27,7 @@ type History interface {
 // everything. Call Compile before Match.
 type Filter struct {
 	IP      string    // single IP or CIDR range
-	Outcome string    // "proxied", "blocked" or "honeypot"
+	Outcome string    // "proxied", "blocked", "honeypot" or "rule"
 	Status  string    // "2xx".."5xx", or "none" for denied requests that got no response
 	Text    string    // case-insensitive substring of host, path, query or user agent
 	Since   time.Time // inclusive; zero = no lower bound
@@ -56,7 +56,7 @@ func (f *Filter) Compile() error {
 		}
 	}
 	switch f.Outcome {
-	case "", "proxied", "blocked", "honeypot":
+	case "", "proxied", "blocked", "honeypot", "rule":
 	default:
 		return fmt.Errorf("invalid outcome %q", f.Outcome)
 	}

@@ -115,7 +115,7 @@ func TestWhitelistPreventsAdd(t *testing.T) {
 
 func TestTempBanExpires(t *testing.T) {
 	bl := newBL(t, nil)
-	if !bl.AddTemp("5.5.5.5", "rate-limit", 20*time.Millisecond) {
+	if !bl.AddTemp("5.5.5.5", "rate-limit", "", 20*time.Millisecond) {
 		t.Fatal("AddTemp should report a new temporary ban")
 	}
 	if !bl.IsBlocked("5.5.5.5") {
@@ -130,14 +130,14 @@ func TestTempBanExpires(t *testing.T) {
 func TestPermanentOutranksTemp(t *testing.T) {
 	bl := newBL(t, nil)
 	bl.Add("1.2.3.4", "honeypot", "")
-	if bl.AddTemp("1.2.3.4", "rate-limit", time.Hour) {
+	if bl.AddTemp("1.2.3.4", "rate-limit", "", time.Hour) {
 		t.Fatal("a temp ban must not override an existing permanent ban")
 	}
 }
 
 func TestUpgradeTempToPermanent(t *testing.T) {
 	bl := newBL(t, nil)
-	bl.AddTemp("1.2.3.4", "rate-limit", 20*time.Millisecond)
+	bl.AddTemp("1.2.3.4", "rate-limit", "", 20*time.Millisecond)
 	if !bl.Add("1.2.3.4", "honeypot", "") {
 		t.Fatal("upgrading a temp ban to permanent should report true")
 	}
@@ -207,8 +207,8 @@ func TestPersistAndReload(t *testing.T) {
 	bl1.Add("9.9.9.0/24", "honeypot", "")
 	// An active temp ban survives a reload; one that lapses while we are down
 	// must be dropped.
-	bl1.AddTemp("5.5.5.5", "rate-limit", time.Hour)
-	bl1.AddTemp("6.6.6.6", "rate-limit", 10*time.Millisecond)
+	bl1.AddTemp("5.5.5.5", "rate-limit", "", time.Hour)
+	bl1.AddTemp("6.6.6.6", "rate-limit", "", 10*time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
 
 	bl2, err := New(file, nil)
@@ -326,7 +326,7 @@ func TestSweepDropsExpiredBans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bl.AddTemp("5.5.5.5", "rate-limit", 10*time.Millisecond)
+	bl.AddTemp("5.5.5.5", "rate-limit", "", 10*time.Millisecond)
 	bl.Add("6.6.6.6", "honeypot", "/x")
 	time.Sleep(30 * time.Millisecond)
 
@@ -351,7 +351,7 @@ func TestSweepDropsExpiredBans(t *testing.T) {
 func TestExpiredExactBanStillCoveredByCIDR(t *testing.T) {
 	bl := newBL(t, nil)
 	bl.Add("7.7.7.0/24", "manual", "")
-	bl.AddTemp("7.7.7.7", "rate-limit", 10*time.Millisecond)
+	bl.AddTemp("7.7.7.7", "rate-limit", "", 10*time.Millisecond)
 	time.Sleep(30 * time.Millisecond)
 	if !bl.IsBlocked("7.7.7.7") {
 		t.Fatal("an expired exact ban must not hide a covering CIDR ban")
@@ -399,7 +399,7 @@ func TestCIDRGroupsOfDifferentLengths(t *testing.T) {
 	bl := newBL(t, nil)
 	bl.Add("10.0.0.0/8", "manual", "")
 	bl.Add("192.168.1.0/24", "manual", "")
-	bl.AddTemp("172.16.5.0/24", "manual", time.Hour)
+	bl.AddTemp("172.16.5.0/24", "manual", "", time.Hour)
 	for ip, want := range map[string]bool{
 		"10.200.3.4":   true,
 		"192.168.1.77": true,
@@ -509,12 +509,12 @@ func TestWhitelistGroups(t *testing.T) {
 
 func TestRemoveCovered(t *testing.T) {
 	bl := newBL(t, nil)
-	bl.Add("192.0.2.5", "honeypot", "/wp-admin")   // inside: removed
-	bl.AddTemp("192.0.2.9", "temp-ban", time.Hour) // inside: removed
-	bl.Add("192.0.2.0/30", "manual", "")           // range inside: removed
-	bl.Add("192.0.0.0/16", "manual", "")           // wider than the feed: kept
-	bl.Add("203.0.113.1", "honeypot", "/.env")     // outside: kept
-	bl.Add("2001:db8::/64", "honeypot", "/.git")   // inside the v6 range: removed
+	bl.Add("192.0.2.5", "honeypot", "/wp-admin")       // inside: removed
+	bl.AddTemp("192.0.2.9", "temp-ban", "", time.Hour) // inside: removed
+	bl.Add("192.0.2.0/30", "manual", "")               // range inside: removed
+	bl.Add("192.0.0.0/16", "manual", "")               // wider than the feed: kept
+	bl.Add("203.0.113.1", "honeypot", "/.env")         // outside: kept
+	bl.Add("2001:db8::/64", "honeypot", "/.git")       // inside the v6 range: removed
 
 	removed := bl.RemoveCovered([]string{"192.0.2.0/28", "2001:db8::/48"})
 	got := map[string]bool{}

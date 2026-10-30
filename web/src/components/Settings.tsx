@@ -111,7 +111,7 @@ function ReloadConfig() {
     <Card title="Configuration">
       <div className="space-y-3 text-sm">
         <p className="text-slate-500">
-          Re-read <code className="font-mono">config.json</code> without restarting. Honeypots, the whitelist, block action,
+          Re-read <code className="font-mono">config.json</code> without restarting. Honeypots, block rules, the whitelist, block action,
           tarpit settings, headers and <code className="font-mono">ipv6_ban_prefix</code> apply immediately; upstreams, routes,
           ports and feature settings need a restart. Sending the process <code className="font-mono">SIGHUP</code> does the
           same.

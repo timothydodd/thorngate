@@ -17,7 +17,11 @@
     { "pattern": ".env", "match": "suffix" },
     { "pattern": "/cgi-bin/*", "match": "glob" },
     { "pattern": "\\.(git|svn|hg)(/|$)", "match": "regex" },
-    { "pattern": "/phpmyadmin", "match": "prefix" }
+    { "pattern": "/phpmyadmin", "match": "prefix" },
+    { "header": "Referer", "pattern": "aocr.org", "match": "contains", "ban_for": "24h" }
+  ],
+  "block_rules": [
+    { "header": "User-Agent", "pattern": "^python-requests/", "match": "regex" }
   ],
   "temp_ban": {
     "enabled": true,

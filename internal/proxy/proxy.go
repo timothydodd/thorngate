@@ -52,7 +52,7 @@ type WAF struct {
 }
 
 // rules are the live-reloadable settings: everything read from cfg on the
-// request path (honeypots, block action, tarpit, client IP / country headers,
+// request path (honeypots, block rules, block action, tarpit, client IP / country headers,
 // ipv6_ban_prefix) plus the no_log set derived from the whitelist.
 type rules struct {
 	cfg   *config.Config
@@ -202,17 +202,8 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Honeypot hit? Blacklist (the IP, or its IPv6 range) and deny.
-	if pattern, hit := honeypot(c, r.URL.Path); hit {
-		if key := w.banKeyFor(c, ip); key != "" && w.bl.Add(key, "honeypot", pattern) {
-			log.Printf("BLACKLISTED ip=%s%s path=%s honeypot=%s ua=%q total=%d",
-				ip, rangeNote(ip, key), r.URL.Path, pattern, r.UserAgent(), w.bl.Count())
-			w.act.Addf(activity.Ban, activity.Info, key, "honeypot",
-				"Banned for hitting honeypot %s (path %s)", pattern, truncate(r.URL.Path, 200))
-			w.dumpHistory(ip, "honeypot")
-			if w.stats != nil {
-				w.stats.Honeypot()
-			}
-		}
+	if h, hit := matchRules(c.Honeypots, r); hit {
+		w.trap(c, ip, r, h)
 		action := w.denyAction(c)
 		if w.stats != nil && !quiet {
 			w.observeDenied(c, ip, r, "honeypot", action)
@@ -221,7 +212,18 @@ func (w *WAF) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Hostname override? Otherwise fall through to the default upstream.
+	// 3. Block rule? Deny this request only; the client is not banned.
+	if h, hit := matchRules(c.BlockRules, r); hit {
+		action := w.denyAction(c)
+		if w.stats != nil && !quiet {
+			w.observeDenied(c, ip, r, "rule", action)
+		}
+		log.Printf("BLOCKED ip=%s path=%s rule=%q%s ua=%q", ip, r.URL.Path, h.Label(), subjectNote(h, r), r.UserAgent())
+		w.deny(c, action, rw, r)
+		return
+	}
+
+	// 4. Hostname override? Otherwise fall through to the default upstream.
 	up, target := w.upstreamFor(r)
 
 	// With no response-inspecting feature enabled (or a quiet no_log IP), proxy
@@ -363,7 +365,7 @@ func (w *WAF) monitorResponse(c *config.Config, ip string, status int) {
 	if key == "" {
 		return
 	}
-	if !w.mon.Strike(key) || !w.bl.AddTemp(key, "rate-limit", tb.BanDur()) {
+	if !w.mon.Strike(key) || !w.bl.AddTemp(key, "rate-limit", "", tb.BanDur()) {
 		return
 	}
 	log.Printf("TEMP-BANNED ip=%s%s for=%s (>=%d bad responses in %s, last=%d) total=%d",
@@ -413,14 +415,68 @@ func canonicalIP(s string) string {
 	return s
 }
 
-// honeypot checks the request path against the honeypots. The cleaned path is
-// checked too: "/x/../wp-admin", "//wp-admin" and (on IIS) "/x\..\wp-admin"
-// all reach the upstream's /wp-admin though the raw path doesn't start with it.
-func honeypot(c *config.Config, reqPath string) (string, bool) {
-	if clean := cleanPath(reqPath); clean != reqPath {
-		return c.Honeypots.Match(reqPath, clean)
+// matchRules checks a request against a rule list (honeypots or block rules).
+// Path rules see the cleaned path too: "/x/../wp-admin", "//wp-admin" and (on
+// IIS) "/x\..\wp-admin" all reach the upstream's /wp-admin though the raw path
+// doesn't start with it. Header rules see the named request header.
+func matchRules(rules config.Honeypots, r *http.Request) (*config.Honeypot, bool) {
+	if len(rules) == 0 {
+		return nil, false
 	}
-	return c.Honeypots.Match(reqPath)
+	reqPath := r.URL.Path
+	if clean := cleanPath(reqPath); clean != reqPath {
+		return rules.MatchRequest(r.Header, reqPath, clean)
+	}
+	return rules.MatchRequest(r.Header, reqPath)
+}
+
+// trap bans the client that tripped honeypot h — permanently, or for the
+// honeypot's ban_for — and logs it. Whitelisted clients are left alone.
+func (w *WAF) trap(c *config.Config, ip string, r *http.Request, h *config.Honeypot) {
+	key := w.banKeyFor(c, ip)
+	if key == "" {
+		return
+	}
+	label := h.Label()
+	var added bool
+	if d := h.BanDuration(); d > 0 {
+		added = w.bl.AddTemp(key, "honeypot", label, d)
+	} else {
+		added = w.bl.Add(key, "honeypot", label)
+	}
+	if !added {
+		return
+	}
+	span := "permanently"
+	if h.BanDuration() > 0 {
+		span = "for " + h.BanFor
+	}
+	log.Printf("BLACKLISTED ip=%s%s %s path=%s honeypot=%q%s ua=%q total=%d",
+		ip, rangeNote(ip, key), span, r.URL.Path, label, subjectNote(h, r), r.UserAgent(), w.bl.Count())
+	w.act.Addf(activity.Ban, activity.Info, key, "honeypot",
+		"Banned %s for hitting honeypot %s (%s)", span, label, subjectDetail(h, r))
+	w.dumpHistory(ip, "honeypot")
+	if w.stats != nil {
+		w.stats.Honeypot()
+	}
+}
+
+// subjectNote is a log suffix (" referer=\"...\"") with the header value a
+// header rule matched; empty for path rules (the path is always logged).
+func subjectNote(h *config.Honeypot, r *http.Request) string {
+	if h.Header == "" {
+		return ""
+	}
+	return fmt.Sprintf(" %s=%q", strings.ToLower(h.Header), truncate(r.Header.Get(h.Header), 200))
+}
+
+// subjectDetail is the activity-log description of what matched: the path, or
+// the header value for header rules.
+func subjectDetail(h *config.Honeypot, r *http.Request) string {
+	if h.Header == "" {
+		return "path " + truncate(r.URL.Path, 200)
+	}
+	return h.Header + " " + truncate(r.Header.Get(h.Header), 200)
 }
 
 // cleanPath resolves "." / ".." / duplicate slashes (and backslashes, which IIS
@@ -481,7 +537,7 @@ func (w *WAF) deny(c *config.Config, action string, rw http.ResponseWriter, r *h
 	}
 }
 
-// observeDenied records a denied (blocked/honeypot) request in the stats feed.
+// observeDenied records a denied (blocked/honeypot/rule) request in the stats feed.
 // Caller has already checked w.stats != nil. A written 403 is recorded by its
 // status; drop/tarpit write nothing, so status is 0 and Deny says what happened.
 func (w *WAF) observeDenied(c *config.Config, ip string, r *http.Request, outcome, action string) {

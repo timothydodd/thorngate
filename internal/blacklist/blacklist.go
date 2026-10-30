@@ -436,11 +436,11 @@ func (b *Blacklist) Add(ip, reason, path string) bool {
 	return b.add(ip, reason, path, time.Time{})
 }
 
-// AddTemp blacklists an IP or CIDR range until now+dur. No-op for whitelisted
-// IPs or entries that are already permanently blocked. Returns true if a new
-// temporary ban was set.
-func (b *Blacklist) AddTemp(ip, reason string, dur time.Duration) bool {
-	return b.add(ip, reason, "", time.Now().UTC().Add(dur))
+// AddTemp blacklists an IP or CIDR range until now+dur. path is the honeypot
+// that was hit, or "". No-op for whitelisted IPs or entries that are already
+// permanently blocked. Returns true if a new temporary ban was set.
+func (b *Blacklist) AddTemp(ip, reason, path string, dur time.Duration) bool {
+	return b.add(ip, reason, path, time.Now().UTC().Add(dur))
 }
 
 // add applies one ban and persists it if anything changed.

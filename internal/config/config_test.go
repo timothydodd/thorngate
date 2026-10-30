@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,7 +11,7 @@ import (
 
 func mustCompile(t *testing.T, h Honeypot) Honeypot {
 	t.Helper()
-	if err := h.compile(); err != nil {
+	if err := h.compile("ban"); err != nil {
 		t.Fatalf("compile %+v: %v", h, err)
 	}
 	return h
@@ -326,5 +327,133 @@ func TestWhitelistFeeds(t *testing.T) {
 		if _, err := loadJSON(t, `{"upstream":"10.0.0.1","whitelist_feeds":`+bad+`}`); err == nil {
 			t.Errorf("whitelist_feeds %s should be rejected", bad)
 		}
+	}
+}
+
+func TestHeaderRulesMatchTheNamedHeader(t *testing.T) {
+	c, err := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":[
+		{"header":"referer","pattern":"aocr.org","match":"contains","ban_for":"24h"},
+		{"header":"User-Agent","pattern":"^evilbot/","match":"regex"},
+		"/wp-admin"
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Honeypots[0].Header; got != "Referer" {
+		t.Errorf("header should be canonicalized, got %q", got)
+	}
+	if got := c.Honeypots[0].BanDuration(); got != 24*time.Hour {
+		t.Errorf("BanDuration = %v, want 24h", got)
+	}
+	if got := c.Honeypots[2].BanDuration(); got != 0 {
+		t.Errorf("a honeypot without ban_for must be permanent, got %v", got)
+	}
+	if got := c.Honeypots[0].Label(); got != "Referer: aocr.org" {
+		t.Errorf("Label = %q", got)
+	}
+
+	hdr := func(k, v string) http.Header {
+		h := http.Header{}
+		h.Set(k, v)
+		return h
+	}
+	cases := []struct {
+		name string
+		hdr  http.Header
+		path string
+		want string // Label of the rule expected to match, "" for none
+	}{
+		{"referer contains", hdr("Referer", "https://www.AOCR.org/some/page"), "/", "Referer: aocr.org"},
+		{"other referer", hdr("Referer", "https://example.com/"), "/", ""},
+		{"no headers", nil, "/", ""},
+		{"ua regex", hdr("User-Agent", "EvilBot/1.0"), "/", "User-Agent: ^evilbot/"},
+		{"ua regex not anchored elsewhere", hdr("User-Agent", "Mozilla evilbot/1.0"), "/", ""},
+		{"header value never checked against path rules", hdr("Referer", "/wp-admin"), "/", ""},
+		{"path rule still works", hdr("Referer", "https://example.com/"), "/wp-admin", "/wp-admin"},
+	}
+	for _, tc := range cases {
+		h, ok := c.Honeypots.MatchRequest(tc.hdr, tc.path)
+		got := ""
+		if ok {
+			got = h.Label()
+		}
+		if got != tc.want {
+			t.Errorf("%s: matched %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	// Match (path only) ignores header rules entirely.
+	if p, ok := c.Honeypots.Match("/wp-admin"); !ok || p != "/wp-admin" {
+		t.Errorf("Match(/wp-admin) = %q %v", p, ok)
+	}
+}
+
+func TestHeaderRulePrefixIsPlain(t *testing.T) {
+	// Path-rule prefixes are boundary-aware and get a leading "/"; header-rule
+	// prefixes are plain string prefixes on the header value.
+	h := mustCompile(t, Honeypot{Header: "Referer", Pattern: "https://aocr", Match: "prefix"})
+	if h.Pattern != "https://aocr" {
+		t.Errorf("header prefix pattern must not be given a leading slash: %q", h.Pattern)
+	}
+	if !h.Matches("https://aocr.org/x") {
+		t.Error("plain prefix should match")
+	}
+	if h.Matches("x https://aocr.org") {
+		t.Error("prefix should not match mid-string")
+	}
+}
+
+func TestRuleBanForValidation(t *testing.T) {
+	for _, bad := range []string{
+		`{"pattern":"/x","ban_for":"soon"}`,
+		`{"pattern":"/x","ban_for":"0s"}`,
+		`{"pattern":"/x","ban_for":"-1h"}`,
+	} {
+		if _, err := loadJSON(t, `{"upstream":"10.0.0.1","honeypots":[`+bad+`]}`); err == nil {
+			t.Errorf("honeypot %s should be rejected", bad)
+		}
+	}
+	if _, err := loadJSON(t, `{"upstream":"10.0.0.1","block_rules":[{"pattern":"/x","ban_for":"1h"}]}`); err == nil {
+		t.Error("ban_for on a block rule should be rejected: block rules never ban")
+	}
+	if _, err := loadJSON(t, `{"upstream":"10.0.0.1","block_rules":[{"header":"Referer","pattern":"aocr.org","match":"contains"}]}`); err != nil {
+		t.Errorf("valid block rule rejected: %v", err)
+	}
+}
+
+func TestHeaderRulesThatMatchEverythingAreRejected(t *testing.T) {
+	for _, rule := range []string{
+		`{"header":"Referer","pattern":".*","match":"regex"}`,
+		`{"header":"Referer","pattern":"^","match":"regex"}`,
+		`{"header":"Referer","pattern":"*","match":"glob"}`,
+	} {
+		for _, list := range []string{"honeypots", "block_rules"} {
+			if _, err := loadJSON(t, `{"upstream":"10.0.0.1","`+list+`":[`+rule+`]}`); err == nil {
+				t.Errorf("%s %s matches every request with the header and should be rejected", list, rule)
+			}
+		}
+	}
+	// Block rules get the same site-root guard as honeypots.
+	if _, err := loadJSON(t, `{"upstream":"10.0.0.1","block_rules":["/"]}`); err == nil {
+		t.Error("a block rule matching / would block every visitor and should be rejected")
+	}
+}
+
+func TestBlockRulesReloadLive(t *testing.T) {
+	a, _ := loadJSON(t, `{"upstream":"10.0.0.1","block_rules":["/a"]}`)
+	b, _ := loadJSON(t, `{"upstream":"10.0.0.1","block_rules":["/b"]}`)
+	if got := a.ReloadBlocked(b); len(got) != 0 {
+		t.Errorf("block_rules changes should reload live, got %v", got)
+	}
+}
+
+// The repo's example config.json is what the README points people at; it must
+// always load.
+func TestExampleConfigLoads(t *testing.T) {
+	c, err := Load(filepath.Join("..", "..", "config.json"))
+	if err != nil {
+		t.Fatalf("config.json in the repo root does not load: %v", err)
+	}
+	if len(c.Honeypots) == 0 || len(c.BlockRules) == 0 {
+		t.Errorf("example config should demonstrate honeypots and block_rules, got %d/%d", len(c.Honeypots), len(c.BlockRules))
 	}
 }

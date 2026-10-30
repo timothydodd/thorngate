@@ -60,7 +60,7 @@ func (s *server) handleAddBlacklist(w http.ResponseWriter, r *http.Request) {
 	}
 	var added bool
 	if dur > 0 {
-		added = s.Blacklist.AddTemp(ip, reason, dur)
+		added = s.Blacklist.AddTemp(ip, reason, "", dur)
 	} else {
 		added = s.Blacklist.Add(ip, reason, "")
 	}

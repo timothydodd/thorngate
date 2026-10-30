@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -39,8 +40,14 @@ type Config struct {
 	BlacklistFile string `json:"blacklist_file"`
 
 	// Honeypots are patterns that should never be hit by a legitimate client.
-	// Any external IP that matches one is blacklisted immediately.
+	// Any external IP that matches one is blacklisted immediately — for good,
+	// or for the honeypot's ban_for duration when it sets one.
 	Honeypots Honeypots `json:"honeypots"`
+
+	// BlockRules are matched like honeypots but only deny the matching request
+	// (with BlockAction); the client is NOT blacklisted. Use them for traffic
+	// that is unwanted rather than hostile, e.g. referrer spam.
+	BlockRules Honeypots `json:"block_rules"`
 
 	// BlockAction is what a blocked client (blacklisted IP or honeypot hit)
 	// receives. "tarpit" (default) never responds at all: the connection is
@@ -476,25 +483,57 @@ func (c *Config) NoLogSpecs() []string {
 //
 // Matching ignores case unless CaseSensitive is set: probes like "/WP-Admin"
 // reach case-insensitive upstreams (IIS/ASP.NET) just like "/wp-admin" does.
+//
+// By default the pattern is matched against the request path. With Header set
+// it is matched against that request header's value instead (e.g. "Referer",
+// "User-Agent"); a request without the header never matches. "prefix" is then a
+// plain string prefix, and "glob" matches the whole header value.
+//
+// BanFor turns a honeypot's ban temporary: "24h" bans the client for a day
+// instead of forever. The same matcher type is used for Config.BlockRules,
+// which deny the request without banning anyone (BanFor is not allowed there).
 type Honeypot struct {
 	Pattern       string `json:"pattern"`
 	Match         string `json:"match"`
 	CaseSensitive bool   `json:"case_sensitive"`
+	Header        string `json:"header"`
+	BanFor        string `json:"ban_for"`
 
-	fold string         // Pattern, lowercased unless CaseSensitive
-	re   *regexp.Regexp // compiled, for match == "regex"
+	fold   string         // Pattern, lowercased unless CaseSensitive
+	re     *regexp.Regexp // compiled, for match == "regex"
+	banDur time.Duration  // parsed BanFor; 0 = permanent
 }
 
 // Honeypots is the configured honeypot list.
 type Honeypots []Honeypot
 
-// Match returns the pattern of the first honeypot tripped by any of the given
-// forms of the request path (e.g. raw and cleaned). Each path is lowercased at
-// most once, not once per honeypot.
+// Match returns the pattern of the first path honeypot tripped by any of the
+// given forms of the request path (e.g. raw and cleaned). Header honeypots are
+// skipped; see MatchRequest.
 func (hs Honeypots) Match(paths ...string) (string, bool) {
+	if h, ok := hs.MatchRequest(nil, paths...); ok {
+		return h.Pattern, true
+	}
+	return "", false
+}
+
+// MatchRequest returns the first honeypot tripped by a request, given its
+// headers and the forms of its path to check (e.g. raw and cleaned). Rules are
+// tried in config order; each path is lowercased at most once, not once per
+// honeypot.
+func (hs Honeypots) MatchRequest(hdr http.Header, paths ...string) (*Honeypot, bool) {
 	var lower []string
 	for i := range hs {
 		h := &hs[i]
+		if h.Header != "" {
+			if hdr == nil {
+				continue
+			}
+			if v := hdr.Get(h.Header); v != "" && h.Matches(v) {
+				return h, true
+			}
+			continue
+		}
 		for j, p := range paths {
 			if !h.CaseSensitive {
 				if lower == nil {
@@ -506,11 +545,11 @@ func (hs Honeypots) Match(paths ...string) (string, bool) {
 				p = lower[j]
 			}
 			if h.matchFolded(p) {
-				return h.Pattern, true
+				return h, true
 			}
 		}
 	}
-	return "", false
+	return nil, false
 }
 
 // UnmarshalJSON lets a honeypot be a bare string (prefix) or a full object.
@@ -533,14 +572,17 @@ func (h *Honeypot) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (h *Honeypot) compile() error {
+// compile validates the rule and precomputes its matcher. verb names what a
+// match does ("ban" / "block") for the catch-all error message.
+func (h *Honeypot) compile(verb string) error {
 	// Checked before prefix normalization, which would turn "" into "/".
 	if h.Pattern == "" {
-		return fmt.Errorf("honeypot pattern is empty")
+		return fmt.Errorf("pattern is empty")
 	}
+	h.Header = http.CanonicalHeaderKey(strings.TrimSpace(h.Header))
 	switch h.Match {
 	case "prefix":
-		if !strings.HasPrefix(h.Pattern, "/") {
+		if h.Header == "" && !strings.HasPrefix(h.Pattern, "/") {
 			h.Pattern = "/" + h.Pattern
 		}
 	case "contains", "suffix":
@@ -566,37 +608,71 @@ func (h *Honeypot) compile() error {
 	if !h.CaseSensitive {
 		h.fold = strings.ToLower(h.Pattern)
 	}
+	if h.BanFor != "" {
+		d, err := time.ParseDuration(h.BanFor)
+		if err != nil {
+			return fmt.Errorf("ban_for %q: %w", h.BanFor, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("ban_for %q: must be positive", h.BanFor)
+		}
+		h.banDur = d
+	}
+	if h.Header != "" {
+		// A header rule that matches the empty string (".*", "^", ...) would
+		// catch every request carrying the header at all.
+		if h.Matches("") {
+			return fmt.Errorf("pattern %q matches any %s header and would %s every visitor", h.Pattern, h.Header, verb)
+		}
+		return nil
+	}
 	// The site root is always legitimate traffic. A honeypot that matches it
 	// ("/" as a prefix, "/" as contains/suffix, ".*" as a regex, ...) would
 	// permanently ban every visitor on their first request.
 	if h.Matches("/") {
-		return fmt.Errorf("pattern %q matches the site root \"/\" and would ban every visitor", h.Pattern)
+		return fmt.Errorf("pattern %q matches the site root \"/\" and would %s every visitor", h.Pattern, verb)
 	}
 	return nil
 }
 
-// Matches reports whether a request path trips this honeypot.
-func (h *Honeypot) Matches(reqPath string) bool {
+// Matches reports whether a subject — the request path, or the value of the
+// rule's header — trips this rule.
+func (h *Honeypot) Matches(subject string) bool {
 	if !h.CaseSensitive {
-		reqPath = strings.ToLower(reqPath)
+		subject = strings.ToLower(subject)
 	}
-	return h.matchFolded(reqPath)
+	return h.matchFolded(subject)
 }
 
-// matchFolded matches a path already lowercased when the honeypot ignores case.
-func (h *Honeypot) matchFolded(reqPath string) bool {
+// BanDuration is how long a honeypot ban lasts; 0 means permanent.
+func (h *Honeypot) BanDuration() time.Duration { return h.banDur }
+
+// Label names the rule in logs and the blacklist: the pattern, prefixed with
+// the header for header rules ("Referer: aocr.org").
+func (h *Honeypot) Label() string {
+	if h.Header != "" {
+		return h.Header + ": " + h.Pattern
+	}
+	return h.Pattern
+}
+
+// matchFolded matches a subject already lowercased when the rule ignores case.
+func (h *Honeypot) matchFolded(subject string) bool {
 	switch h.Match {
 	case "prefix":
-		return prefixMatch(reqPath, h.fold)
+		if h.Header != "" {
+			return strings.HasPrefix(subject, h.fold)
+		}
+		return prefixMatch(subject, h.fold)
 	case "contains":
-		return strings.Contains(reqPath, h.fold)
+		return strings.Contains(subject, h.fold)
 	case "suffix":
-		return strings.HasSuffix(reqPath, h.fold)
+		return strings.HasSuffix(subject, h.fold)
 	case "glob":
-		ok, _ := path.Match(h.fold, reqPath)
+		ok, _ := path.Match(h.fold, subject)
 		return ok
 	case "regex":
-		return h.re.MatchString(reqPath)
+		return h.re.MatchString(subject)
 	}
 	return false
 }
@@ -669,8 +745,16 @@ func Load(filePath string) (*Config, error) {
 		seenFeeds[f.URL] = true
 	}
 	for i := range c.Honeypots {
-		if err := c.Honeypots[i].compile(); err != nil {
+		if err := c.Honeypots[i].compile("ban"); err != nil {
 			return nil, fmt.Errorf("config: honeypot %d: %w", i, err)
+		}
+	}
+	for i := range c.BlockRules {
+		if c.BlockRules[i].BanFor != "" {
+			return nil, fmt.Errorf("config: block_rules %d: ban_for is not allowed (block rules never ban; use a honeypot)", i)
+		}
+		if err := c.BlockRules[i].compile("block"); err != nil {
+			return nil, fmt.Errorf("config: block_rules %d: %w", i, err)
 		}
 	}
 	switch c.BlockAction {
@@ -742,7 +826,7 @@ func strictUnmarshal(b []byte, v any) error {
 }
 
 // ReloadBlocked lists the settings that differ between c and old but only take
-// effect on restart. Everything else — honeypots, whitelist, whitelist feeds, block action,
+// effect on restart. Everything else — honeypots, block rules, whitelist, whitelist feeds, block action,
 // tarpit, client IP / country headers, ipv6_ban_prefix — applies on reload.
 func (c *Config) ReloadBlocked(old *Config) []string {
 	var out []string

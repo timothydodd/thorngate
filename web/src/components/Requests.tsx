@@ -15,6 +15,7 @@ const OUTCOMES = [
   { value: 'proxied', label: 'Proxied' },
   { value: 'blocked', label: 'Blocked' },
   { value: 'honeypot', label: 'Honeypot' },
+  { value: 'rule', label: 'Block rule', title: 'Denied by a block_rules entry; the client is not banned' },
 ]
 
 const STATUSES = [

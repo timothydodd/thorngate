@@ -138,7 +138,7 @@ export function Badge({ tone = 'slate', children, title }: { tone?: Tone; childr
   )
 }
 
-const outcomeTone: Record<string, Tone> = { blocked: 'rose', honeypot: 'amber', proxied: 'slate' }
+const outcomeTone: Record<string, Tone> = { blocked: 'rose', honeypot: 'amber', rule: 'violet', proxied: 'slate' }
 
 export function OutcomeBadge({ outcome }: { outcome: string }) {
   return <Badge tone={outcomeTone[outcome] ?? 'slate'}>{outcome}</Badge>

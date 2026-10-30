@@ -153,7 +153,7 @@ export default function IPPanel({ ip, onClose }: { ip: string; onClose: () => vo
                 <Fact label="First seen" value={s.first_seen ? ago(s.first_seen) : '—'} title={s.first_seen && fullTime(s.first_seen)} />
                 <Fact label="Last seen" value={s.last_seen ? ago(s.last_seen) : '—'} title={s.last_seen && fullTime(s.last_seen)} />
               </div>
-              <Breakdown label="Outcome" counts={s.outcomes} total={s.requests} tone={{ proxied: 'bg-slate-400', blocked: 'bg-rose-500', honeypot: 'bg-amber-500' }} />
+              <Breakdown label="Outcome" counts={s.outcomes} total={s.requests} tone={{ proxied: 'bg-slate-400', blocked: 'bg-rose-500', honeypot: 'bg-amber-500', rule: 'bg-violet-500' }} />
               <Breakdown
                 label="Status"
                 counts={s.statuses}

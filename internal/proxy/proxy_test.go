@@ -440,3 +440,110 @@ func TestEventsCarryCountryAndUAAndReachArchive(t *testing.T) {
 		t.Errorf("honeypot hit should be archived too: %+v", arch.events[1])
 	}
 }
+
+func TestHeaderHoneypotTempBansClient(t *testing.T) {
+	var hits int32
+	w, bl := newWAF(t, okBackend(&hits), `,"block_action":"forbidden","honeypots":[
+		{"header":"Referer","pattern":"aocr.org","match":"contains","ban_for":"24h"}
+	]`)
+
+	// An unrelated referrer is proxied.
+	r := reqFrom("8.8.4.4", "/")
+	r.Header.Set("Referer", "https://example.com/")
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("normal referrer: status %d hits %d, want 200/1", rec.Code, hits)
+	}
+
+	// The spam referrer is denied, and the client is banned — temporarily.
+	r = reqFrom("8.8.8.8", "/")
+	r.Header.Set("Referer", "https://AOCR.org/landing")
+	rec = httptest.NewRecorder()
+	w.ServeHTTP(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("spam referrer status = %d, want 403", rec.Code)
+	}
+	e, ok := bl.Lookup("8.8.8.8")
+	if !ok {
+		t.Fatal("client should be blacklisted after a header honeypot hit")
+	}
+	if e.Until.IsZero() {
+		t.Fatal("ban_for honeypot should set a temporary ban, got permanent")
+	}
+	if left := time.Until(e.Until); left < 23*time.Hour || left > 25*time.Hour {
+		t.Errorf("ban should last ~24h, expires in %v", left)
+	}
+	if e.Reason != "honeypot" || e.Path != "Referer: aocr.org" {
+		t.Errorf("entry = %+v, want reason honeypot / path \"Referer: aocr.org\"", e)
+	}
+	// Now blocked even without the referrer.
+	rec = httptest.NewRecorder()
+	w.ServeHTTP(rec, reqFrom("8.8.8.8", "/"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("banned client status = %d, want 403", rec.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("denied traffic must not reach upstream (hits = %d)", hits)
+	}
+}
+
+func TestBlockRuleDeniesWithoutBanning(t *testing.T) {
+	var hits int32
+	w, bl := newWAF(t, okBackend(&hits), `,"block_action":"forbidden","block_rules":[
+		{"header":"Referer","pattern":"aocr.org","match":"contains"},
+		"/private"
+	]`)
+	st := stats.New(60, 100)
+	w.stats = st
+
+	r := reqFrom("5.5.5.5", "/")
+	r.Header.Set("Referer", "https://aocr.org/")
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("block rule status = %d, want 403", rec.Code)
+	}
+	if bl.IsBlocked("5.5.5.5") {
+		t.Fatal("a block rule must not blacklist the client")
+	}
+	// Same client, no spam referrer: proxied as normal.
+	rec = httptest.NewRecorder()
+	w.ServeHTTP(rec, reqFrom("5.5.5.5", "/"))
+	if rec.Code != http.StatusOK || hits != 1 {
+		t.Fatalf("after a block-rule denial the client should still be served: status %d hits %d", rec.Code, hits)
+	}
+	// Path block rules work too, with the cleaned path.
+	rec = httptest.NewRecorder()
+	w.ServeHTTP(rec, reqFrom("5.5.5.5", "/x/../private/data"))
+	if rec.Code != http.StatusForbidden || hits != 1 {
+		t.Fatalf("path block rule: status %d hits %d, want 403/1", rec.Code, hits)
+	}
+	if bl.Count() != 0 {
+		t.Fatalf("blacklist should be empty, has %d", bl.Count())
+	}
+
+	// The feed records the denial with its own outcome.
+	res, err := st.Query(stats.Filter{Outcome: "rule"}, 1, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Events) != 2 {
+		t.Fatalf("want 2 rule-denied events in the feed, got %d", len(res.Events))
+	}
+}
+
+func TestReloadSwapsBlockRules(t *testing.T) {
+	var hits int32
+	w, bl := newWAF(t, okBackend(&hits), `,"block_action":"forbidden","block_rules":["/old"]`)
+	w.Reload(loadCfg(t, `{"upstream":"10.0.0.1","block_action":"forbidden","block_rules":["/new"]}`))
+
+	rec := httptest.NewRecorder()
+	w.ServeHTTP(rec, reqFrom("6.6.6.6", "/new"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatal("a newly added block rule should deny")
+	}
+	if bl.Count() != 0 {
+		t.Fatal("block rules never ban")
+	}
+}
