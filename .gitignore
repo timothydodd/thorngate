@@ -8,3 +8,4 @@ admin_credentials.json
 # `go build` works without Node; only node_modules is ignored.
 /web/node_modules/
 /web/dist/
+.DS_Store
